@@ -260,10 +260,16 @@ def get_current_user(
     check_service_fee(user)
     check_premium_status(user)
     return user
+@app.get("/")
+def root():
+    return {"message": "Haven API is running"}
 
-@app.get("/") ; def root(): return {"message": "Haven API is running"}
-@api_router.get("/") ; def api_root(): return {"message": "Haven API"}
+@api_router.get("/")
+def api_root():
+    return {"message": "Haven API"}
 
+
+    
 @api_router.post("/auth/google")
 def auth_google(payload: GoogleAuthPayload, response: Response):
     email, name, picture, ref = payload.email, payload.name, payload.picture, payload.ref
