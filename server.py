@@ -608,11 +608,11 @@ def get_my_profile(user: dict = Depends(get_current_user)):
 
 # ---------- Image Proxy (with permanent cache headers) ----------
 @api_router.get("/images/{user_id}/{filename:path}")
-async def serve_image(
-    user_id: str,
-    filename: str,
-    user: dict = Depends(get_current_user)   # 👈 requires valid session
-):
+async def serve_image(user_id: str, filename: str):
+    """Serve compressed images from Supabase Storage without authentication.
+       The bucket is private, and the image URLs are only embedded in
+       profile responses that already require authentication.
+    """
     path = f"{user_id}/{filename}"
     try:
         file_data = sb.storage.from_(STORAGE_BUCKET).download(path)
