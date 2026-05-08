@@ -1268,7 +1268,7 @@ def payfast_boost_activate_sandbox(user: dict = Depends(get_current_user)):
 
 # ---------- App wiring ----------
 app.include_router(api_router)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+#app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
