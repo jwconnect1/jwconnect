@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, Header
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
@@ -49,7 +49,7 @@ api_router = APIRouter(prefix="/api")
 # ---------- Constants ----------
 EARTH_RADIUS_KM = 6371
 MAX_GPS_AGE_HOURS = 24
-STORAGE_BUCKET = "avatars"   # your private bucket
+STORAGE_BUCKET = "avatars"   # your bucket – make sure it's public in Supabase
 
 # ---------- Helpers ----------
 def _parse_dt(value):
@@ -111,25 +111,6 @@ async def get_location_from_ip(ip: str) -> tuple:
         logger.error(f"IP geolocation failed: {e}")
     return None
 
-# ---------- Image proxy helpers ----------
-def get_proxied_image_url(supabase_url: str) -> str:
-    """Convert a public Supabase storage URL (or any image URL) to a private proxy URL."""
-    if not supabase_url:
-        return supabase_url
-
-    # Already our proxy URL (absolute or relative)
-    backend_url = os.environ.get("BACKEND_PUBLIC_URL", "https://api.havenpositive.online").rstrip("/")
-    if supabase_url.startswith(f"{backend_url}/api/images/") or supabase_url.startswith("/api/images/"):
-        return supabase_url
-
-    # Extract the path after the bucket name
-    if f"/{STORAGE_BUCKET}/" in supabase_url:
-        path = supabase_url.split(f"/{STORAGE_BUCKET}/")[-1]
-        return f"{backend_url}/api/images/{path}"
-
-    # Fallback (external images, Google pictures) – leave untouched
-    return supabase_url
-
 # ---------- Image Helpers ----------
 def compress_image(base64_str: str, max_size_kb: int = 300) -> bytes:
     if "," in base64_str:
@@ -156,11 +137,13 @@ def upload_image_to_supabase(file_bytes: bytes, user_id: str, filename: str) -> 
     sb.storage.from_(STORAGE_BUCKET).upload(
         path=path,
         file=file_bytes,
-        file_options={"content-type": "image/jpeg"}
+        file_options={
+            "content-type": "image/jpeg",
+            "cache-control": "public, max-age=31536000, immutable"
+        }
     )
-    # Return the direct public URL but we'll convert later
-    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{path}"
-    return get_proxied_image_url(public_url)
+    # Return direct public URL (CDN will cache it)
+    return f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/{path}"
 
 def process_image_field(image_value: str, user_id: str, filename_prefix: str) -> str:
     if not image_value:
@@ -402,7 +385,7 @@ def get_profile(user: dict) -> dict:
             "health_status": None, "latitude": None, "longitude": None,
             "display_name": user.get("name",""), "bio": "", "interests": "", "looking_for": "",
             "education": "", "kids": "", "want_kids": "", "smoke": "", "drink": "", "employment": "",
-            "profile_image": get_proxied_image_url(user.get("picture","")),
+            "profile_image": user.get("picture",""),
             "gallery_images": [],
             "onboarding_complete": False,
             "pref_gender": "", "pref_min_age": 18, "pref_max_age": 99,
@@ -416,8 +399,6 @@ def get_profile(user: dict) -> dict:
     lon = profile.get("gps_longitude")
     country = profile.get("country") if lat is not None else None
     city = profile.get("city") if lat is not None else None
-    profile_image = get_proxied_image_url(profile.get("profile_image") or user.get("picture",""))
-    gallery = [get_proxied_image_url(url) for url in (profile.get("gallery_images") or [])]
     return {
         "user_id": profile["user_id"], "email": user.get("email",""), "name": user.get("name",""),
         "date_of_birth": profile.get("date_of_birth"), "gender": profile.get("gender"),
@@ -430,8 +411,8 @@ def get_profile(user: dict) -> dict:
         "education": profile.get("education",""), "kids": profile.get("kids",""),
         "want_kids": profile.get("want_kids",""), "smoke": profile.get("smoke",""),
         "drink": profile.get("drink",""), "employment": profile.get("employment",""),
-        "profile_image": profile_image,
-        "gallery_images": gallery,
+        "profile_image": profile.get("profile_image") or user.get("picture",""),
+        "gallery_images": profile.get("gallery_images") or [],
         "onboarding_complete": profile.get("onboarding_complete", False),
         "pref_gender": profile.get("pref_gender",""), "pref_min_age": profile.get("pref_min_age",18),
         "pref_max_age": profile.get("pref_max_age",99), "pref_country": profile.get("pref_country",""),
@@ -592,16 +573,12 @@ def get_discover_profiles(user: dict = Depends(get_current_user)):
                 continue
         p["distance_km"] = round(distance, 1) if distance is not None else None
         p["age"] = age
-        # Convert image URLs to proxy
-        p["profile_image"] = get_proxied_image_url(p.get("profile_image",""))
-        p["gallery_images"] = [get_proxied_image_url(url) for url in (p.get("gallery_images") or [])]
         filtered.append(p)
     random.shuffle(filtered)
     return filtered[:50]
 
 @api_router.post("/discover/swipe")
 def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
-    # ... (keep existing swipe code) ...
     if payload.direction not in ["like","pass"]: raise HTTPException(400)
     target = _maybe(sb.table("user_profiles").select("user_id").eq("user_id", payload.swiped_id).maybe_single().execute())
     if not target: raise HTTPException(404)
@@ -670,13 +647,17 @@ def get_matches(swipe_type: Optional[str] = 'dating', user: dict = Depends(get_c
         partner_id = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
         profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", partner_id).maybe_single().execute())
         if profile:
+            # count unread messages from the partner
+            unread_res = sb.table("match_messages").select("message_id", count="exact").eq("match_id", m["match_id"]).eq("read", False).eq("sender_id", partner_id).execute()
+            unread = unread_res.count if hasattr(unread_res, 'count') else 0
             result.append({
                 "match_id": m["match_id"], "user_id": partner_id,
                 "display_name": profile.get("display_name",""),
-                "profile_image": get_proxied_image_url(profile.get("profile_image","")),
+                "profile_image": profile.get("profile_image",""),
                 "bio": profile.get("bio",""), "country": profile.get("country",""), "city": profile.get("city",""),
                 "health_status": profile.get("health_status"),
-                "created_at": m["created_at"]
+                "created_at": m["created_at"],
+                "unread_count": unread
             })
     return result
 
@@ -709,9 +690,6 @@ def send_match_message(match_id: str, payload: MatchMessagePayload, user: dict =
         "created_at": datetime.now(timezone.utc).isoformat()
     }).execute()
     return {"ok": True, "message": msg}
-
-
-
 
 @api_router.delete("/discover/matches/{match_id}")
 def unmatch(match_id: str, user: dict = Depends(get_current_user)):
@@ -746,51 +724,8 @@ def unmatch(match_id: str, user: dict = Depends(get_current_user)):
 
     return {"ok": True}
 
-
-
-
-
-
-@api_router.get("/requests")
-def get_requests(user: dict = Depends(get_current_user)):
-    dating = sb.table("dating_requests").select("*").eq("to_user_id", user["user_id"]).eq("status", "pending").execute().data or []
-    friend = sb.table("friend_requests").select("*").eq("to_user_id", user["user_id"]).eq("status", "pending").execute().data or []
-    result = []
-    for req in dating:
-        from_profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,country").eq("user_id", req["from_user_id"]).maybe_single().execute())
-        if from_profile:
-            result.append({
-                "request_id": req["request_id"],
-                "type": "dating",
-                "from_user_id": req["from_user_id"],
-                "from_name": from_profile.get("display_name","Someone"),
-                "from_image": get_proxied_image_url(from_profile.get("profile_image","")),
-                "from_country": from_profile.get("country",""),
-                "created_at": req["created_at"],
-                "status": req["status"],
-            })
-    for req in friend:
-        from_profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,country").eq("user_id", req["from_user_id"]).maybe_single().execute())
-        if from_profile:
-            result.append({
-                "request_id": req["request_id"],
-                "type": "friend",
-                "from_user_id": req["from_user_id"],
-                "from_name": from_profile.get("display_name","Someone"),
-                "from_image": get_proxied_image_url(from_profile.get("profile_image","")),
-                "from_country": from_profile.get("country",""),
-                "created_at": req["created_at"],
-                "status": req["status"],
-            })
-    return result
-
-
-
-
-
 @api_router.get("/unread-counts")
 def get_unread_counts(user: dict = Depends(get_current_user)):
-    # Count unread messages where user is the recipient (sender != user)
     unread_res = sb.table("match_messages") \
         .select("match_id") \
         .neq("sender_id", user["user_id"]) \
@@ -812,8 +747,38 @@ def get_unread_counts(user: dict = Depends(get_current_user)):
                     dating_count += 1
     return {"dating_unread": dating_count, "friend_unread": friend_count}
 
-
-
+@api_router.get("/requests")
+def get_requests(user: dict = Depends(get_current_user)):
+    dating = sb.table("dating_requests").select("*").eq("to_user_id", user["user_id"]).eq("status", "pending").execute().data or []
+    friend = sb.table("friend_requests").select("*").eq("to_user_id", user["user_id"]).eq("status", "pending").execute().data or []
+    result = []
+    for req in dating:
+        from_profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,country").eq("user_id", req["from_user_id"]).maybe_single().execute())
+        if from_profile:
+            result.append({
+                "request_id": req["request_id"],
+                "type": "dating",
+                "from_user_id": req["from_user_id"],
+                "from_name": from_profile.get("display_name","Someone"),
+                "from_image": from_profile.get("profile_image",""),
+                "from_country": from_profile.get("country",""),
+                "created_at": req["created_at"],
+                "status": req["status"],
+            })
+    for req in friend:
+        from_profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,country").eq("user_id", req["from_user_id"]).maybe_single().execute())
+        if from_profile:
+            result.append({
+                "request_id": req["request_id"],
+                "type": "friend",
+                "from_user_id": req["from_user_id"],
+                "from_name": from_profile.get("display_name","Someone"),
+                "from_image": from_profile.get("profile_image",""),
+                "from_country": from_profile.get("country",""),
+                "created_at": req["created_at"],
+                "status": req["status"],
+            })
+    return result
 
 @api_router.post("/requests/{request_id}/respond")
 def respond_request(request_id: str, action: str, user: dict = Depends(get_current_user)):
@@ -855,7 +820,7 @@ def get_notifications(user: dict = Depends(get_current_user)):
     for n in notifs:
         from_profile = _maybe(sb.table("user_profiles").select("display_name,profile_image").eq("user_id", n["from_user_id"]).maybe_single().execute())
         n["from_name"] = from_profile.get("display_name","Someone") if from_profile else "Someone"
-        n["from_image"] = get_proxied_image_url(from_profile.get("profile_image","") if from_profile else "")
+        n["from_image"] = from_profile.get("profile_image","") if from_profile else ""
     return notifs
 
 @api_router.post("/notifications/read")
@@ -868,7 +833,7 @@ def mark_notifications_read(user: dict = Depends(get_current_user)):
 def create_story(payload: CreateStoryPayload, user: dict = Depends(get_current_user)):
     if payload.category not in ["HIV","HPV","HSV"]: raise HTTPException(400)
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
-    author_avatar = get_proxied_image_url(profile.get("profile_image") if profile else user.get("picture",""))
+    author_avatar = profile.get("profile_image") if profile else user.get("picture","")
     story = {"story_id": f"story_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"],
              "author_name": profile.get("display_name", user.get("name","")),
              "author_avatar": author_avatar,
@@ -885,7 +850,7 @@ def get_stories(category: Optional[str] = None, user: dict = Depends(get_current
     for s in stories:
         like = _maybe(sb.table("story_likes").select("like_id").eq("user_id", user["user_id"]).eq("story_id", s["story_id"]).maybe_single().execute())
         s["liked_by_user"] = like is not None
-        s["author_avatar"] = get_proxied_image_url(s.get("author_avatar",""))
+        # No need to transform avatar URL; it's already a public Supabase URL
     return stories
 
 @api_router.get("/stories/{story_id}")
@@ -894,7 +859,6 @@ def get_story(story_id: str, user: dict = Depends(get_current_user)):
     if not story: raise HTTPException(404)
     like = _maybe(sb.table("story_likes").select("like_id").eq("user_id", user["user_id"]).eq("story_id", story_id).maybe_single().execute())
     story["liked_by_user"] = like is not None
-    story["author_avatar"] = get_proxied_image_url(story.get("author_avatar",""))
     comments = sb.table("story_comments").select("*").eq("story_id", story_id).order("created_at").execute().data or []
     story["comments"] = build_comment_tree(comments)
     return story
@@ -921,7 +885,7 @@ def create_comment(story_id: str, payload: CreateCommentPayload, user: dict = De
         parent = _maybe(sb.table("story_comments").select("comment_id").eq("comment_id", payload.parent_id).maybe_single().execute())
         if not parent: raise HTTPException(404)
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
-    author_avatar = get_proxied_image_url(profile.get("profile_image") if profile else user.get("picture",""))
+    author_avatar = profile.get("profile_image") if profile else user.get("picture","")
     comment = {"comment_id": f"cmt_{uuid.uuid4().hex[:12]}", "story_id": story_id, "user_id": user["user_id"],
                "author_name": profile.get("display_name", user.get("name","")),
                "author_avatar": author_avatar,
@@ -942,22 +906,6 @@ def build_comment_tree(comments):
         if c.get("parent_id") and c["parent_id"] in cmap: cmap[c["parent_id"]]["replies"].append(node)
         else: roots.append(node)
     return roots
-
-# ---------- Secure Image Proxy (REQUIRES AUTHENTICATION) ----------
-@api_router.get("/images/{full_path:path}")
-async def serve_proxied_image(full_path: str, user: dict = Depends(get_current_user)):
-    try:
-        file_bytes = sb.storage.from_(STORAGE_BUCKET).download(full_path)
-        return Response(
-            content=file_bytes,
-            media_type="image/jpeg",   # adjust if needed
-            headers={
-                "Cache-Control": "private, max-age=86400",  # 1 day, private prevents public caching
-            }
-        )
-    except Exception as e:
-        logger.error(f"Image proxy error: {e}")
-        raise HTTPException(status_code=404, detail="Image not found")
 
 # ---------- Countries/Cities ----------
 @api_router.get("/location/countries")
