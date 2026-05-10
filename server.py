@@ -1,10 +1,9 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Depends, Cookie, Header
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
-import os, logging, hashlib, uuid, random, math, httpx, io, base64
-from urllib.parse import quote
+import os, logging, uuid, random, math, httpx, io, base64
 from pathlib import Path
 from pydantic import BaseModel
 from typing import Optional, List
@@ -19,8 +18,10 @@ SUPABASE_KEY = os.environ['SUPABASE_SERVICE_ROLE_KEY']
 sb: Client = create_client(SUPABASE_URL.rstrip('/'), SUPABASE_KEY)
 
 app = FastAPI()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ---------- CORS – only ONE, correct configuration ----------
+# ---------- CORS ----------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -39,40 +40,8 @@ app.add_middleware(
 api_router = APIRouter(prefix="/api")
 
 # ---------- Constants ----------
-FREE_CARD_TTL_MINUTES = 20
-PREMIUM_CARD_TTL_MINUTES = 35
-VOTES_PER_TOKEN = 10
-INITIAL_AD_TOKENS = 3
-DIAMOND_BOOST_COST = 5
-DIAMOND_BOOST_MINUTES = 10
-UPGRADE_COST_SOL = 0.012
-MONTHLY_SERVICE_FEE_SOL = 0.01
-DEFAULT_VOTE_COST_SOL = 0.001
 EARTH_RADIUS_KM = 6371
-STORAGE_BUCKET = "avatars"
-IMAGE_URL_PREFIX = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}"
 MAX_GPS_AGE_HOURS = 24
-
-PREMIUM_TIERS = {
-    "silver": {"diamond_cost": 45, "duration_days": 30, "label": "Silver"},
-    "gold": {"diamond_cost": 243, "duration_days": 180, "label": "Gold"},
-    "platinum": {"diamond_cost": 432, "duration_days": 365, "label": "Platinum"},
-}
-
-SYSTEM_IMAGES = [
-    "https://images.unsplash.com/photo-1723283126758-28f2a308bc47?crop=entropy&cs=srgb&fm=jpg&w=800&q=80",
-    "https://images.unsplash.com/photo-1689154345830-861f74006b09?crop=entropy&cs=srgb&fm=jpg&w=800&q=80",
-    "https://images.pexels.com/photos/29888428/pexels-photo-29888428.jpeg?auto=compress&cs=tinysrgb&w=800",
-    "https://images.pexels.com/photos/25626583/pexels-photo-25626583.jpeg?auto=compress&cs=tinysrgb&w=800",
-    "https://images.unsplash.com/photo-1639817754460-9af351966008?crop=entropy&cs=srgb&fm=jpg&w=800&q=80",
-    "https://images.unsplash.com/photo-1557672172-298e090bd0f1?auto=format&fit=crop&w=800&q=80",
-    "https://images.unsplash.com/photo-1558865869-c93f6f8482af?auto=format&fit=crop&w=800&q=80",
-    "https://images.unsplash.com/photo-1579547945413-497e1b99dac0?auto=format&fit=crop&w=800&q=80",
-    "https://images.unsplash.com/photo-1618331835717-801e976710b2?auto=format&fit=crop&w=800&q=80",
-    "https://images.unsplash.com/photo-1550684848-fac1c5b4e853?auto=format&fit=crop&w=800&q=80",
-    "https://images.unsplash.com/photo-1604871000636-074fa5117945?auto=format&fit=crop&w=800&q=80",
-    "https://images.unsplash.com/photo-1614850523459-c2f4c699c52e?auto=format&fit=crop&w=800&q=80",
-]
 
 # ---------- Helpers ----------
 def _parse_dt(value):
@@ -157,12 +126,12 @@ def compress_image(base64_str: str, max_size_kb: int = 300) -> bytes:
 
 def upload_image_to_supabase(file_bytes: bytes, user_id: str, filename: str) -> str:
     path = f"{user_id}/{filename}"
-    sb.storage.from_(STORAGE_BUCKET).upload(
+    sb.storage.from_("avatars").upload(
         path=path,
         file=file_bytes,
         file_options={"content-type": "image/jpeg"}
     )
-    return f"{IMAGE_URL_PREFIX}/{path}"
+    return f"{SUPABASE_URL}/storage/v1/object/public/avatars/{path}"
 
 def process_image_field(image_value: str, user_id: str, filename_prefix: str) -> str:
     if not image_value:
@@ -177,53 +146,14 @@ def process_image_field(image_value: str, user_id: str, filename_prefix: str) ->
             return image_value
     return image_value
 
-# ========== CRITICAL FIX: Convert Supabase URLs to proxy URLs ==========
-def get_proxied_image_url(supabase_url: str) -> str:
-    """
-    Convert a Supabase storage URL to your backend proxy URL.
-    Example: https://.../avatars/user_xxx/photo.jpg
-         → https://api.havenpositive.online/api/images/user_xxx/photo.jpg
-    """
-    if not supabase_url:
-        return supabase_url
-
-    # Already our proxy URL (absolute or relative) – return as is
-    if supabase_url.startswith("https://api.havenpositive.online/api/images/") or supabase_url.startswith("/api/images/"):
-        return supabase_url
-
-    # Extract the path after the bucket name
-    if "/avatars/" in supabase_url:
-        path = supabase_url.split("/avatars/")[-1]
-        backend_url = os.environ.get("BACKEND_PUBLIC_URL", "https://api.havenpositive.online").rstrip("/")
-        return f"{backend_url}/api/images/{path}"
-
-    # Fallback (external images, system images)
-    return supabase_url
-
 # ---------- Models ----------
 class LocationUpdatePayload(BaseModel):
     latitude: float
     longitude: float
     accuracy: Optional[float] = None
 
-class CardCreate(BaseModel):
-    image_url: str
-    smart_link: Optional[str] = ""
-    title: Optional[str] = ""
-    use_diamond_boost: Optional[bool] = False
-    card_type: Optional[str] = "smartlink"
-    vote_cost_sol: Optional[float] = DEFAULT_VOTE_COST_SOL
-
-class ConnectWalletRequest(BaseModel): wallet_address: str
-class UpgradeRequest(BaseModel): tx_hash: str
-class ServiceFeeRequest(BaseModel): tx_hash: str
-class CryptoVoteRequest(BaseModel):
-    card_id: str; tx_hash: str; amount_sol: float
-
 class GoogleAuthPayload(BaseModel):
     id_token: str; email: str; name: str; picture: str; ref: Optional[str] = None
-class PayfastInitiatePayload(BaseModel):
-    return_url: str; cancel_url: str
 
 class ProfileSetupPayload(BaseModel):
     date_of_birth: str; gender: str; health_status: str
@@ -265,9 +195,6 @@ class SwipePayload(BaseModel):
 class MatchMessagePayload(BaseModel):
     content: str
 
-class PurchasePremiumPayload(BaseModel):
-    tier: str
-
 # ---------- Auth ----------
 def get_current_user(
     request: Request,
@@ -283,8 +210,6 @@ def get_current_user(
     if _parse_dt(session["expires_at"]) < datetime.now(timezone.utc): raise HTTPException(status_code=401)
     user = _maybe(sb.table("users").select("*").eq("user_id", session["user_id"]).maybe_single().execute())
     if not user: raise HTTPException(status_code=401, detail="User not found")
-    check_service_fee(user)
-    check_premium_status(user)
     return user
 
 @app.get("/")
@@ -296,69 +221,48 @@ def api_root():
     return {"message": "Haven API"}
 
 @api_router.post("/auth/google")
-def auth_google(payload: GoogleAuthPayload, response: Response):
-    email, name, picture, ref = payload.email, payload.name, payload.picture, payload.ref
+def auth_google(payload: GoogleAuthPayload, request: Request, response: Response):
+    email, name, picture = payload.email, payload.name, payload.picture
     session_token = f"session_{uuid.uuid4().hex[:32]}"
     existing = _maybe(sb.table("users").select("*").eq("email", email).maybe_single().execute())
     now_iso = datetime.now(timezone.utc).isoformat()
     if existing:
         user_id = existing["user_id"]
-        updates = {"name": name, "picture": picture}
-        if not existing.get("referral_code"): updates["referral_code"] = uuid.uuid4().hex[:8]
-        sb.table("users").update(updates).eq("user_id", user_id).execute()
+        sb.table("users").update({"name": name, "picture": picture}).eq("user_id", user_id).execute()
     else:
         user_id = f"user_{uuid.uuid4().hex[:12]}"
-        referral_code = uuid.uuid4().hex[:8]; referred_by = None
-        if ref:
-            ref_user = _maybe(sb.table("users").select("*").eq("referral_code", ref).maybe_single().execute())
-            if ref_user and ref_user["user_id"] != user_id:
-                referred_by = ref_user["user_id"]
-                sb.table("users").update({"diamonds": (ref_user.get("diamonds") or 0) + 1}).eq("user_id", ref_user["user_id"]).execute()
         sb.table("users").insert({
             "user_id": user_id, "email": email, "name": name, "picture": picture,
-            "ad_tokens": INITIAL_AD_TOKENS, "sol_balance": 0.0, "is_upgraded": False,
-            "is_premium": False, "wallet_address": None, "diamonds": 0,
-            "premium_until": None, "upgrade_date": None, "last_service_fee_date": None,
-            "votes_since_token": 0, "referral_code": referral_code, "referred_by": referred_by,
-            "service_fee_paid": False, "created_at": now_iso,
+            "created_at": now_iso,
         }).execute()
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({"session_token": session_token, "user_id": user_id, "expires_at": expires_at.isoformat(), "created_at": now_iso}).execute()
-    # Set HTTP‑only cookie (for future session)
-    response.set_cookie(key="session_token", value=session_token, httponly=True, secure=False, samesite="lax", path="/", max_age=7*24*60*60)
-    # Also return token in body (for frontend localStorage)
+    response.set_cookie(
+        key="session_token",
+        value=session_token,
+        httponly=True,
+        secure=request.url.scheme == "https",  # secure only on HTTPS
+        samesite="lax",
+        path="/",
+        max_age=7*24*60*60
+    )
     return {"ok": True, "user_id": user_id, "token": session_token}
 
 @api_router.get("/auth/me")
 def auth_me(user: dict = Depends(get_current_user)):
-    check_service_fee(user)
-    check_premium_status(user)
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     onboarding_complete = profile.get("onboarding_complete", False) if profile else False
-    notif_count = sb.table("notifications").select("notification_id", count="exact").eq("user_id", user["user_id"]).eq("read", False).execute()
-    unread = notif_count.count if hasattr(notif_count, 'count') else 0
-    
     has_gps = profile and profile.get("gps_latitude") is not None if profile else False
     gps_stale = False
     if has_gps and profile.get("gps_verified_at"):
         gps_age = datetime.now(timezone.utc) - _parse_dt(profile["gps_verified_at"])
         gps_stale = gps_age > timedelta(hours=MAX_GPS_AGE_HOURS)
-    
+    notif_count = sb.table("notifications").select("notification_id", count="exact").eq("user_id", user["user_id"]).eq("read", False).execute()
+    unread = notif_count.count if hasattr(notif_count, 'count') else 0
     return {
         "user_id": user["user_id"], "email": user["email"], "name": user["name"],
-        "picture": user.get("picture", ""), "ad_tokens": user.get("ad_tokens", 0),
-        "sol_balance": user.get("sol_balance", 0), "is_upgraded": user.get("is_upgraded", False),
-        "is_premium": user.get("is_premium", False), "wallet_address": user.get("wallet_address"),
-        "diamonds": user.get("diamonds", 0), "premium_until": user.get("premium_until"),
-        "votes_since_token": user.get("votes_since_token", 0), "votes_per_token": VOTES_PER_TOKEN,
-        "referral_code": user.get("referral_code"),
-        "diamond_boost_cost": DIAMOND_BOOST_COST, "diamond_boost_minutes": DIAMOND_BOOST_MINUTES,
-        "upgrade_cost_sol": UPGRADE_COST_SOL, "monthly_service_fee_sol": MONTHLY_SERVICE_FEE_SOL,
-        "vote_cost_sol": DEFAULT_VOTE_COST_SOL, "service_fee_paid": user.get("service_fee_paid", False),
-        "upgrade_date": user.get("upgrade_date"), "last_service_fee_date": user.get("last_service_fee_date"),
+        "picture": user.get("picture", ""),
         "onboarding_complete": onboarding_complete,
-        "premium_tier": user.get("premium_tier", "free"),
-        "premium_expires_at": user.get("premium_expires_at"),
         "unread_notifications": unread,
         "has_gps": has_gps,
         "gps_stale": gps_stale,
@@ -372,26 +276,6 @@ def auth_logout(response: Response, session_token_cookie: Optional[str] = Cookie
     if token: sb.table("user_sessions").delete().eq("session_token", token).execute()
     response.delete_cookie(key="session_token", path="/", samesite="lax", secure=False)
     return {"ok": True}
-
-def check_service_fee(user: dict):
-    if not user.get("is_upgraded"): return
-    last_fee = user.get("last_service_fee_date")
-    if last_fee:
-        if datetime.now(timezone.utc) > _parse_dt(last_fee) + timedelta(days=30):
-            sb.table("users").update({"service_fee_paid": False}).eq("user_id", user["user_id"]).execute()
-    else:
-        now = datetime.now(timezone.utc)
-        sb.table("users").update({"last_service_fee_date": now.isoformat(), "service_fee_paid": True}).eq("user_id", user["user_id"]).execute()
-
-def check_premium_status(user: dict):
-    tier = user.get("premium_tier", "free")
-    expires_at = user.get("premium_expires_at")
-    if tier != "free" and expires_at:
-        expires_dt = _parse_dt(expires_at)
-        if expires_dt and expires_dt < datetime.now(timezone.utc):
-            sb.table("users").update({"premium_tier": "free", "premium_expires_at": None}).eq("user_id", user["user_id"]).execute()
-            user["premium_tier"] = "free"
-            user["premium_expires_at"] = None
 
 # ---------- Location API ----------
 @api_router.post("/location/update")
@@ -479,117 +363,6 @@ def get_location_status(user: dict = Depends(get_current_user)):
         "message": "GPS location expired - please refresh" if is_stale else "GPS location valid"
     }
 
-# ---------- Wallet & Upgrade ----------
-@api_router.post("/wallet/connect")
-def connect_wallet(payload: ConnectWalletRequest, user: dict = Depends(get_current_user)):
-    sb.table("users").update({"wallet_address": payload.wallet_address}).eq("user_id", user["user_id"]).execute()
-    return {"ok": True, "wallet_address": payload.wallet_address}
-
-@api_router.post("/upgrade/verify")
-def verify_upgrade(payload: UpgradeRequest, user: dict = Depends(get_current_user)):
-    if not user.get("wallet_address"): raise HTTPException(400, "Connect wallet first")
-    existing = _maybe(sb.table("sol_transactions").select("tx_id").eq("tx_hash", payload.tx_hash).maybe_single().execute())
-    if existing: raise HTTPException(400, "Transaction already used")
-    now = datetime.now(timezone.utc)
-    sb.table("sol_transactions").insert({"tx_id": f"up_{uuid.uuid4().hex[:12]}", "from_user_id": user["user_id"], "to_user_id": None, "tx_type": "upgrade", "amount_sol": UPGRADE_COST_SOL, "tx_hash": payload.tx_hash, "status": "confirmed", "confirmed_at": now.isoformat()}).execute()
-    sb.table("users").update({"is_upgraded": True, "upgrade_date": now.isoformat(), "last_service_fee_date": now.isoformat(), "service_fee_paid": True, "sol_balance": 0.0}).eq("user_id", user["user_id"]).execute()
-    return {"ok": True, "is_upgraded": True}
-
-@api_router.post("/service-fee/verify")
-def verify_service_fee(payload: ServiceFeeRequest, user: dict = Depends(get_current_user)):
-    if not user.get("is_upgraded"): raise HTTPException(400, "Not upgraded")
-    existing = _maybe(sb.table("sol_transactions").select("tx_id").eq("tx_hash", payload.tx_hash).maybe_single().execute())
-    if existing: raise HTTPException(400, "Transaction already used")
-    now = datetime.now(timezone.utc)
-    sb.table("sol_transactions").insert({"tx_id": f"fee_{uuid.uuid4().hex[:12]}", "from_user_id": user["user_id"], "to_user_id": None, "tx_type": "service_fee", "amount_sol": MONTHLY_SERVICE_FEE_SOL, "tx_hash": payload.tx_hash, "status": "confirmed"}).execute()
-    sb.table("users").update({"last_service_fee_date": now.isoformat(), "service_fee_paid": True}).eq("user_id", user["user_id"]).execute()
-    return {"ok": True, "next_fee_due": (now+timedelta(days=30)).isoformat(), "service_fee_paid": True}
-
-# ---------- Cards ----------
-def _card_public(doc: dict) -> dict:
-    return {"card_id": doc["card_id"], "owner_id": doc["owner_id"], "owner_name": doc.get("owner_name",""), "image_url": doc["image_url"], "smart_link": doc.get("smart_link",""), "title": doc.get("title",""), "votes": doc.get("votes",0), "created_at": doc["created_at"], "expires_at": doc["expires_at"], "is_premium": doc.get("is_premium",False), "diamond_boosted": doc.get("diamond_boosted",False), "card_type": doc.get("card_type","smartlink"), "vote_cost_sol": doc.get("vote_cost_sol",DEFAULT_VOTE_COST_SOL), "owner_wallet": doc.get("owner_wallet")}
-
-@api_router.post("/cards")
-def create_card(payload: CardCreate, user: dict = Depends(get_current_user)):
-    card_type = payload.card_type
-    if card_type == "crypto":
-        if not user.get("is_upgraded"): raise HTTPException(402, "Upgrade required")
-        if not user.get("wallet_address"): raise HTTPException(400, "Connect wallet first")
-        if not user.get("service_fee_paid"): raise HTTPException(402, "Service fee payment required")
-        token_cost, smart_link, recipient_wallet = 0, "", user.get("wallet_address")
-    else:
-        if user.get("ad_tokens", 0) < 1: raise HTTPException(402, "Not enough ad tokens")
-        token_cost = 1
-        if not payload.smart_link or not payload.smart_link.startswith(("http://", "https://")): raise HTTPException(400)
-        smart_link, recipient_wallet = payload.smart_link, None
-    if not payload.image_url: raise HTTPException(400, "image_url is required")
-    base_ttl = PREMIUM_CARD_TTL_MINUTES if user.get("is_premium") else FREE_CARD_TTL_MINUTES
-    now = datetime.now(timezone.utc)
-    expires = now + timedelta(minutes=base_ttl)
-    card = {"card_id": f"card_{uuid.uuid4().hex[:12]}", "owner_id": user["user_id"], "owner_name": user.get("name",""), "image_url": payload.image_url, "smart_link": smart_link, "title": payload.title or "", "votes": 0, "created_at": now.isoformat(), "expires_at": expires.isoformat(), "is_premium": bool(user.get("is_premium",False)), "diamond_boosted": False, "card_type": card_type, "vote_cost_sol": payload.vote_cost_sol if card_type == "crypto" else 0.0, "owner_wallet": recipient_wallet}
-    sb.table("cards").insert(card).execute()
-    if token_cost > 0: sb.table("users").update({"ad_tokens": user["ad_tokens"] - 1}).eq("user_id", user["user_id"]).execute()
-    if payload.use_diamond_boost: sb.table("users").update({"diamonds": user.get("diamonds", 0) - DIAMOND_BOOST_COST}).eq("user_id", user["user_id"]).execute()
-    return _card_public(card)
-
-@api_router.get("/cards/marketplace")
-def get_marketplace(user: dict = Depends(get_current_user), filter_type: Optional[str] = None):
-    now_iso = datetime.now(timezone.utc).isoformat()
-    query = sb.table("cards").select("*").gt("expires_at", now_iso).neq("owner_id", user["user_id"])
-    if not user.get("is_upgraded"): query = query.or_("card_type.eq.smartlink,card_type.is.null")
-    elif filter_type: query = query.eq("card_type", filter_type)
-    cards = (query.limit(500).execute()).data or []
-    random.shuffle(cards)
-    return [_card_public(c) for c in cards[:12]]
-
-@api_router.get("/cards/mine")
-def get_my_cards(user: dict = Depends(get_current_user)):
-    cards = (sb.table("cards").select("*").eq("owner_id", user["user_id"]).order("created_at", desc=True).limit(500).execute()).data or []
-    return [_card_public(c) for c in cards]
-
-@api_router.post("/cards/{card_id}/vote")
-def vote_card(card_id: str, user: dict = Depends(get_current_user)):
-    card = _maybe(sb.table("cards").select("*").eq("card_id", card_id).maybe_single().execute())
-    if not card: raise HTTPException(404, "Card not found")
-    if card["owner_id"] == user["user_id"]: raise HTTPException(400)
-    if _parse_dt(card["expires_at"]) < datetime.now(timezone.utc): raise HTTPException(400, "Card has expired")
-    if card.get("card_type") == "crypto": raise HTTPException(400, "Use crypto-vote")
-    sb.table("votes").insert({"vote_id": f"vote_{uuid.uuid4().hex[:12]}", "voter_id": user["user_id"], "card_id": card_id, "owner_id": card["owner_id"]}).execute()
-    sb.table("cards").update({"votes": card.get("votes",0)+1}).eq("card_id", card_id).execute()
-    new_progress = user.get("votes_since_token",0) + 1
-    tokens_earned = new_progress // VOTES_PER_TOKEN
-    new_progress %= VOTES_PER_TOKEN
-    new_tokens = user.get("ad_tokens",0) + tokens_earned
-    sb.table("users").update({"votes_since_token": new_progress, "ad_tokens": new_tokens}).eq("user_id", user["user_id"]).execute()
-    return {"ok": True, "smart_link": card["smart_link"], "ad_tokens": new_tokens, "votes_since_token": new_progress, "tokens_earned": tokens_earned}
-
-@api_router.post("/cards/{card_id}/crypto-vote")
-def crypto_vote_card(card_id: str, payload: CryptoVoteRequest, user: dict = Depends(get_current_user)):
-    card = _maybe(sb.table("cards").select("*").eq("card_id", card_id).maybe_single().execute())
-    if not card: raise HTTPException(404)
-    if card["owner_id"] == user["user_id"]: raise HTTPException(400)
-    if card.get("card_type") != "crypto": raise HTTPException(400)
-    if _parse_dt(card["expires_at"]) < datetime.now(timezone.utc): raise HTTPException(400)
-    owner = _maybe(sb.table("users").select("*").eq("user_id", card["owner_id"]).maybe_single().execute())
-    if not owner or not owner.get("service_fee_paid"): raise HTTPException(400, "Card owner's service fee not current")
-    existing = _maybe(sb.table("sol_transactions").select("tx_id").eq("tx_hash", payload.tx_hash).maybe_single().execute())
-    if existing: raise HTTPException(400, "Transaction already used")
-    vote_cost = card.get("vote_cost_sol", DEFAULT_VOTE_COST_SOL)
-    now = datetime.now(timezone.utc)
-    sb.table("sol_transactions").insert({"tx_id": f"cv_{uuid.uuid4().hex[:12]}", "from_user_id": user["user_id"], "to_user_id": card["owner_id"], "tx_type": "vote_reward", "amount_sol": vote_cost, "tx_hash": payload.tx_hash, "status": "confirmed"}).execute()
-    sb.table("cards").update({"votes": card.get("votes",0)+1}).eq("card_id", card_id).execute()
-    sb.table("users").update({"sol_balance": float(owner.get("sol_balance",0)) + vote_cost}).eq("user_id", card["owner_id"]).execute()
-    return {"ok": True, "votes": card.get("votes",0)+1, "amount_sol": vote_cost}
-
-# ---------- Referral ----------
-@api_router.get("/referral/me")
-def referral_me(user: dict = Depends(get_current_user)):
-    return {"referral_code": user.get("referral_code"), "diamonds": user.get("diamonds",0), "diamond_boost_cost": DIAMOND_BOOST_COST, "diamond_boost_minutes": DIAMOND_BOOST_MINUTES}
-
-@api_router.get("/images/library")
-def image_library(user: dict = Depends(get_current_user)):
-    return {"images": SYSTEM_IMAGES}
-
 # ---------- Profile ----------
 def get_profile(user: dict) -> dict:
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
@@ -609,15 +382,10 @@ def get_profile(user: dict) -> dict:
             "gps_latitude": None, "gps_longitude": None, "gps_verified_at": None,
             "location_source": "none",
         }
-    # Use GPS location
     lat = profile.get("gps_latitude")
     lon = profile.get("gps_longitude")
     country = profile.get("country") if lat is not None else None
     city = profile.get("city") if lat is not None else None
-    profile_image = profile.get("profile_image", "")
-    profile_image = get_proxied_image_url(profile_image) if profile_image else user.get("picture","")
-    gallery = profile.get("gallery_images") or []
-    gallery_proxied = [get_proxied_image_url(url) for url in gallery if url]
     return {
         "user_id": profile["user_id"], "email": user.get("email",""), "name": user.get("name",""),
         "date_of_birth": profile.get("date_of_birth"), "gender": profile.get("gender"),
@@ -630,8 +398,8 @@ def get_profile(user: dict) -> dict:
         "education": profile.get("education",""), "kids": profile.get("kids",""),
         "want_kids": profile.get("want_kids",""), "smoke": profile.get("smoke",""),
         "drink": profile.get("drink",""), "employment": profile.get("employment",""),
-        "profile_image": profile_image,
-        "gallery_images": gallery_proxied,
+        "profile_image": profile.get("profile_image", user.get("picture","")),
+        "gallery_images": profile.get("gallery_images") or [],
         "onboarding_complete": profile.get("onboarding_complete", False),
         "pref_gender": profile.get("pref_gender",""), "pref_min_age": profile.get("pref_min_age",18),
         "pref_max_age": profile.get("pref_max_age",99), "pref_country": profile.get("pref_country",""),
@@ -641,9 +409,8 @@ def get_profile(user: dict) -> dict:
         "hide_from_min_age": profile.get("hide_from_min_age"),
         "hide_from_max_age": profile.get("hide_from_max_age"),
         "hide_from_health_statuses": profile.get("hide_from_health_statuses",""),
-        "premium_tier": user.get("premium_tier", "free"),
-        "gps_latitude": profile.get("gps_latitude"),
-        "gps_longitude": profile.get("gps_longitude"),
+        "gps_latitude": lat,
+        "gps_longitude": lon,
         "gps_verified_at": profile.get("gps_verified_at"),
         "location_source": profile.get("location_source", "none"),
     }
@@ -732,24 +499,6 @@ async def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
 
-# ---------- Image Proxy ----------
-@api_router.get("/images/{user_id}/{filename:path}")
-async def serve_image(user_id: str, filename: str, user: dict = Depends(get_current_user)):
-    path = f"{user_id}/{filename}"
-    try:
-        file_data = sb.storage.from_(STORAGE_BUCKET).download(path)
-        return Response(
-            content=file_data,
-            media_type="image/jpeg",
-            headers={
-                "Cache-Control": "public, max-age=31536000, immutable",
-                "CDN-Cache-Control": "public, max-age=31536000",
-            }
-        )
-    except Exception as e:
-        logger.error(f"Image proxy error: {e}")
-        raise HTTPException(status_code=404, detail="Image not found")
-
 # ---------- Discovery ----------
 @api_router.get("/discover/profiles")
 def get_discover_profiles(user: dict = Depends(get_current_user)):
@@ -772,7 +521,8 @@ def get_discover_profiles(user: dict = Depends(get_current_user)):
         partner = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
         matched_ids.add(partner)
     query = sb.table("user_profiles").select("*").neq("user_id", user["user_id"]).eq("onboarding_complete", True)
-    query = query.not_.is_("gps_latitude", "null")
+    # FIX: correct NULL check
+    query = query.not_.is_("gps_latitude", None)
     for mid in matched_ids:
         query = query.neq("user_id", mid)
     profiles = (query.limit(200).execute()).data or []
@@ -811,60 +561,9 @@ def get_discover_profiles(user: dict = Depends(get_current_user)):
                 continue
         p["distance_km"] = round(distance, 1) if distance is not None else None
         p["age"] = age
-        p["profile_image"] = get_proxied_image_url(p.get("profile_image",""))
-        gallery = p.get("gallery_images") or []
-        p["gallery_images"] = [get_proxied_image_url(url) for url in gallery if url]
         filtered.append(p)
     random.shuffle(filtered)
     return filtered[:50]
-
-@api_router.get("/discover/matches")
-def get_matches(swipe_type: Optional[str] = 'dating', user: dict = Depends(get_current_user)):
-    matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").eq("swipe_type", swipe_type).order("created_at", desc=True).execute()
-    result = []
-    for m in (matches.data or []):
-        partner_id = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
-        profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", partner_id).maybe_single().execute())
-        if profile:
-            result.append({
-                "match_id": m["match_id"], "user_id": partner_id,
-                "display_name": profile.get("display_name",""),
-                "profile_image": get_proxied_image_url(profile.get("profile_image","")),
-                "bio": profile.get("bio",""), "country": profile.get("country",""), "city": profile.get("city",""),
-                "health_status": profile.get("health_status"),
-                "created_at": m["created_at"]
-            })
-    return result
-
-@api_router.get("/discover/matches/{match_id}/messages")
-def get_match_messages(match_id: str, user: dict = Depends(get_current_user)):
-    match = _maybe(sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
-    if not match: raise HTTPException(404)
-    if user["user_id"] not in [match["user1_id"], match["user2_id"]]: raise HTTPException(403)
-    msgs = sb.table("match_messages").select("*").eq("match_id", match_id).order("created_at").execute().data or []
-    for msg in msgs:
-        if msg["sender_id"] != user["user_id"] and not msg.get("read"):
-            sb.table("match_messages").update({"read": True}).eq("message_id", msg["message_id"]).execute()
-    return msgs
-
-@api_router.post("/discover/matches/{match_id}/messages")
-def send_match_message(match_id: str, payload: MatchMessagePayload, user: dict = Depends(get_current_user)):
-    match = _maybe(sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
-    if not match: raise HTTPException(404)
-    if user["user_id"] not in [match["user1_id"], match["user2_id"]]: raise HTTPException(403)
-    msg = {"message_id": f"msg_{uuid.uuid4().hex[:12]}", "match_id": match_id, "sender_id": user["user_id"], "content": payload.content, "read": False, "created_at": datetime.now(timezone.utc).isoformat()}
-    sb.table("match_messages").insert(msg).execute()
-    other_id = match["user2_id"] if match["user1_id"] == user["user_id"] else match["user1_id"]
-    from_profile = get_profile(user)
-    sb.table("notifications").insert({
-        "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
-        "user_id": other_id,
-        "from_user_id": user["user_id"],
-        "type": "match_message",
-        "message": f"New message from {from_profile.get('display_name', 'Someone')}",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }).execute()
-    return {"ok": True, "message": msg}
 
 @api_router.post("/discover/swipe")
 def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
@@ -909,6 +608,7 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
                 match_id = f"match_{uuid.uuid4().hex[:12]}"
                 sb.table("profile_matches").insert({"match_id": match_id, "user1_id": uid1, "user2_id": uid2, "swipe_type": payload.swipe_type, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
                 matched = True
+                # Send new match notifications to both
                 sb.table("notifications").insert({
                     "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
                     "user_id": payload.swiped_id,
@@ -928,6 +628,54 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
             else: match_id = exist_match["match_id"]
     return {"ok": True, "matched": matched, "match_id": match_id, "direction": payload.direction}
 
+@api_router.get("/discover/matches")
+def get_matches(swipe_type: Optional[str] = 'dating', user: dict = Depends(get_current_user)):
+    matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").eq("swipe_type", swipe_type).order("created_at", desc=True).execute()
+    result = []
+    for m in (matches.data or []):
+        partner_id = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
+        profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", partner_id).maybe_single().execute())
+        if profile:
+            result.append({
+                "match_id": m["match_id"], "user_id": partner_id,
+                "display_name": profile.get("display_name",""),
+                "profile_image": profile.get("profile_image",""),
+                "bio": profile.get("bio",""), "country": profile.get("country",""), "city": profile.get("city",""),
+                "health_status": profile.get("health_status"),
+                "created_at": m["created_at"]
+            })
+    return result
+
+@api_router.get("/discover/matches/{match_id}/messages")
+def get_match_messages(match_id: str, user: dict = Depends(get_current_user)):
+    match = _maybe(sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
+    if not match: raise HTTPException(404)
+    if user["user_id"] not in [match["user1_id"], match["user2_id"]]: raise HTTPException(403)
+    msgs = sb.table("match_messages").select("*").eq("match_id", match_id).order("created_at").execute().data or []
+    for msg in msgs:
+        if msg["sender_id"] != user["user_id"] and not msg.get("read"):
+            sb.table("match_messages").update({"read": True}).eq("message_id", msg["message_id"]).execute()
+    return msgs
+
+@api_router.post("/discover/matches/{match_id}/messages")
+def send_match_message(match_id: str, payload: MatchMessagePayload, user: dict = Depends(get_current_user)):
+    match = _maybe(sb.table("profile_matches").select("*").eq("match_id", match_id).maybe_single().execute())
+    if not match: raise HTTPException(404)
+    if user["user_id"] not in [match["user1_id"], match["user2_id"]]: raise HTTPException(403)
+    msg = {"message_id": f"msg_{uuid.uuid4().hex[:12]}", "match_id": match_id, "sender_id": user["user_id"], "content": payload.content, "read": False, "created_at": datetime.now(timezone.utc).isoformat()}
+    sb.table("match_messages").insert(msg).execute()
+    other_id = match["user2_id"] if match["user1_id"] == user["user_id"] else match["user1_id"]
+    from_profile = get_profile(user)
+    sb.table("notifications").insert({
+        "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
+        "user_id": other_id,
+        "from_user_id": user["user_id"],
+        "type": "match_message",
+        "message": f"New message from {from_profile.get('display_name', 'Someone')}",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }).execute()
+    return {"ok": True, "message": msg}
+
 @api_router.get("/requests")
 def get_requests(user: dict = Depends(get_current_user)):
     dating = sb.table("dating_requests").select("*").eq("to_user_id", user["user_id"]).eq("status", "pending").execute().data or []
@@ -941,7 +689,7 @@ def get_requests(user: dict = Depends(get_current_user)):
                 "type": "dating",
                 "from_user_id": req["from_user_id"],
                 "from_name": from_profile.get("display_name","Someone"),
-                "from_image": get_proxied_image_url(from_profile.get("profile_image","")),
+                "from_image": from_profile.get("profile_image",""),
                 "from_country": from_profile.get("country",""),
                 "created_at": req["created_at"],
                 "status": req["status"],
@@ -954,7 +702,7 @@ def get_requests(user: dict = Depends(get_current_user)):
                 "type": "friend",
                 "from_user_id": req["from_user_id"],
                 "from_name": from_profile.get("display_name","Someone"),
-                "from_image": get_proxied_image_url(from_profile.get("profile_image","")),
+                "from_image": from_profile.get("profile_image",""),
                 "from_country": from_profile.get("country",""),
                 "created_at": req["created_at"],
                 "status": req["status"],
@@ -1001,36 +749,13 @@ def get_notifications(user: dict = Depends(get_current_user)):
     for n in notifs:
         from_profile = _maybe(sb.table("user_profiles").select("display_name,profile_image").eq("user_id", n["from_user_id"]).maybe_single().execute())
         n["from_name"] = from_profile.get("display_name","Someone") if from_profile else "Someone"
-        n["from_image"] = get_proxied_image_url(from_profile.get("profile_image","")) if from_profile else ""
+        n["from_image"] = from_profile.get("profile_image","") if from_profile else ""
     return notifs
 
 @api_router.post("/notifications/read")
 def mark_notifications_read(user: dict = Depends(get_current_user)):
     sb.table("notifications").update({"read": True}).eq("user_id", user["user_id"]).eq("read", False).execute()
     return {"ok": True}
-
-@api_router.get("/location/countries")
-def get_countries():
-    try:
-        resp = httpx.get("https://restcountries.com/v3.1/all?fields=name,cca2", timeout=5)
-        if resp.status_code == 200:
-            return [{"code": c["cca2"], "name": c["name"]["common"]} for c in resp.json()]
-    except: pass
-    return [
-        {"code":"ZA","name":"South Africa"}, {"code":"US","name":"United States"},
-        {"code":"GB","name":"United Kingdom"}, {"code":"CA","name":"Canada"},
-        {"code":"AU","name":"Australia"}, {"code":"IN","name":"India"},
-    ]
-
-@api_router.get("/location/cities")
-def get_cities(country: str):
-    try:
-        resp = httpx.post("https://countriesnow.space/api/v0.1/countries/cities", json={"country": country}, timeout=5)
-        if resp.status_code == 200 and not resp.json().get("error"):
-            return [{"name": c} for c in resp.json().get("data", [])]
-    except: pass
-    fallback = {"South Africa": ["Johannesburg","Cape Town","Durban"], "United States": ["New York","Los Angeles","Chicago"]}
-    return [{"name": c} for c in fallback.get(country, [])]
 
 # ---------- Stories ----------
 @api_router.post("/stories")
@@ -1039,7 +764,7 @@ def create_story(payload: CreateStoryPayload, user: dict = Depends(get_current_u
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     story = {"story_id": f"story_{uuid.uuid4().hex[:12]}", "user_id": user["user_id"],
              "author_name": profile.get("display_name", user.get("name","")),
-             "author_avatar": get_proxied_image_url(profile.get("profile_image", user.get("picture",""))),
+             "author_avatar": profile.get("profile_image", user.get("picture","")),
              "content": payload.content, "category": payload.category, "title": payload.title or "",
              "likes": 0, "comment_count": 0, "created_at": datetime.now(timezone.utc).isoformat()}
     sb.table("stories").insert(story).execute()
@@ -1089,7 +814,7 @@ def create_comment(story_id: str, payload: CreateCommentPayload, user: dict = De
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     comment = {"comment_id": f"cmt_{uuid.uuid4().hex[:12]}", "story_id": story_id, "user_id": user["user_id"],
                "author_name": profile.get("display_name", user.get("name","")),
-               "author_avatar": get_proxied_image_url(profile.get("profile_image", user.get("picture",""))),
+               "author_avatar": profile.get("profile_image", user.get("picture","")),
                "content": payload.content, "parent_id": payload.parent_id, "likes": 0, "reply_count": 0,
                "created_at": datetime.now(timezone.utc).isoformat()}
     sb.table("story_comments").insert(comment).execute()
@@ -1108,107 +833,31 @@ def build_comment_tree(comments):
         else: roots.append(node)
     return roots
 
-# ---------- Premium ----------
-@api_router.post("/premium/purchase")
-def purchase_premium(payload: PurchasePremiumPayload, user: dict = Depends(get_current_user)):
-    if payload.tier not in PREMIUM_TIERS:
-        raise HTTPException(status_code=400, detail="Invalid tier. Choose silver, gold, or platinum.")
-    tier_info = PREMIUM_TIERS[payload.tier]
-    user_diamonds = user.get("diamonds", 0)
-    if user_diamonds < tier_info["diamond_cost"]:
-        raise HTTPException(status_code=402, detail=f"Not enough diamonds. Need {tier_info['diamond_cost']}, have {user_diamonds}.")
-    now = datetime.now(timezone.utc)
-    expires_at = now + timedelta(days=tier_info["duration_days"])
-    new_diamonds = user_diamonds - tier_info["diamond_cost"]
-    sb.table("users").update({
-        "diamonds": new_diamonds,
-        "premium_tier": payload.tier,
-        "premium_expires_at": expires_at.isoformat(),
-    }).eq("user_id", user["user_id"]).execute()
-    sb.table("premium_purchases").insert({
-        "purchase_id": f"prem_{uuid.uuid4().hex[:12]}",
-        "user_id": user["user_id"],
-        "tier": payload.tier,
-        "diamond_cost": tier_info["diamond_cost"],
-        "duration_days": tier_info["duration_days"],
-        "purchased_at": now.isoformat(),
-        "expires_at": expires_at.isoformat(),
-    }).execute()
-    return {
-        "ok": True, "tier": payload.tier,
-        "diamonds_spent": tier_info["diamond_cost"],
-        "diamonds_remaining": new_diamonds,
-        "expires_at": expires_at.isoformat(),
-        "duration_days": tier_info["duration_days"],
-    }
+# ---------- Countries/Cities (kept for display) ----------
+@api_router.get("/location/countries")
+def get_countries():
+    try:
+        resp = httpx.get("https://restcountries.com/v3.1/all?fields=name,cca2", timeout=5)
+        if resp.status_code == 200:
+            return [{"code": c["cca2"], "name": c["name"]["common"]} for c in resp.json()]
+    except: pass
+    return [
+        {"code":"ZA","name":"South Africa"}, {"code":"US","name":"United States"},
+        {"code":"GB","name":"United Kingdom"}, {"code":"CA","name":"Canada"},
+        {"code":"AU","name":"Australia"}, {"code":"IN","name":"India"},
+    ]
 
-@api_router.get("/premium/status")
-def get_premium_status(user: dict = Depends(get_current_user)):
-    tier = user.get("premium_tier", "free")
-    expires_at = user.get("premium_expires_at")
-    is_active = False
-    if tier != "free" and expires_at:
-        expires_dt = _parse_dt(expires_at)
-        if expires_dt and expires_dt > datetime.now(timezone.utc):
-            is_active = True
-    return {
-        "tier": tier,
-        "is_active": is_active,
-        "expires_at": expires_at,
-        "tiers": PREMIUM_TIERS,
-        "diamonds": user.get("diamonds", 0),
-    }
+@api_router.get("/location/cities")
+def get_cities(country: str):
+    try:
+        resp = httpx.post("https://countriesnow.space/api/v0.1/countries/cities", json={"country": country}, timeout=5)
+        if resp.status_code == 200 and not resp.json().get("error"):
+            return [{"name": c} for c in resp.json().get("data", [])]
+    except: pass
+    fallback = {"South Africa": ["Johannesburg","Cape Town","Durban"], "United States": ["New York","Los Angeles","Chicago"]}
+    return [{"name": c} for c in fallback.get(country, [])]
 
-# ---------- PayFast ----------
-def _payfast_signature(params, passphrase=""):
-    filtered = {k: v for k, v in params.items() if v not in (None, "")}
-    pairs = [f"{k}={quote(str(filtered[k]).strip(), safe='')}" for k in sorted(filtered.keys())]
-    query = "&".join(pairs)
-    if passphrase: query += f"&passphrase={quote(passphrase, safe='')}"
-    return hashlib.md5(query.encode("utf-8")).hexdigest()
-
-@api_router.post("/payments/payfast/initiate")
-def payfast_initiate(payload: PayfastInitiatePayload, user: dict = Depends(get_current_user)):
-    mid, mkey, pp = os.environ.get("PAYFAST_MERCHANT_ID",""), os.environ.get("PAYFAST_MERCHANT_KEY",""), os.environ.get("PAYFAST_PASSPHRASE","")
-    sandbox = os.environ.get("PAYFAST_SANDBOX","true").lower() == "true"
-    pid = f"stokvel_{user['user_id']}_{uuid.uuid4().hex[:8]}"
-    params = {"merchant_id": mid, "merchant_key": mkey, "return_url": payload.return_url, "cancel_url": payload.cancel_url,
-              "m_payment_id": pid, "amount": "5.00", "item_name": "Haven Premium", "email_address": user["email"],
-              "subscription_type": "1", "billing_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-              "recurring_amount": "5.00", "frequency": "3", "cycles": "0"}
-    params["signature"] = _payfast_signature(params, pp)
-    sb.table("subscriptions").insert({"m_payment_id": pid, "user_id": user["user_id"], "kind": "subscription", "status": "pending"}).execute()
-    base = "https://sandbox.payfast.co.za/eng/process" if sandbox else "https://www.payfast.co.za/eng/process"
-    return {"redirect_url": f"{base}?{'&'.join([f'{k}={quote(str(v), safe='')}' for k,v in params.items()])}", "m_payment_id": pid}
-
-@api_router.post("/payments/payfast/activate-sandbox")
-def payfast_activate_sandbox(user: dict = Depends(get_current_user)):
-    if os.environ.get("PAYFAST_SANDBOX","true").lower() != "true": raise HTTPException(400)
-    sb.table("users").update({"is_premium": True, "premium_until": (datetime.now(timezone.utc)+timedelta(days=30)).isoformat()}).eq("user_id", user["user_id"]).execute()
-    return {"ok": True, "is_premium": True}
-
-@api_router.post("/payments/payfast/boost/initiate")
-def payfast_boost_initiate(payload: PayfastInitiatePayload, user: dict = Depends(get_current_user)):
-    mid, mkey, pp = os.environ.get("PAYFAST_MERCHANT_ID",""), os.environ.get("PAYFAST_MERCHANT_KEY",""), os.environ.get("PAYFAST_PASSPHRASE","")
-    sandbox = os.environ.get("PAYFAST_SANDBOX","true").lower() == "true"
-    pid = f"boost_{user['user_id']}_{uuid.uuid4().hex[:8]}"
-    params = {"merchant_id": mid, "merchant_key": mkey, "return_url": payload.return_url, "cancel_url": payload.cancel_url,
-              "m_payment_id": pid, "amount": "2.50", "item_name": "Haven Boost Pack", "email_address": user["email"]}
-    params["signature"] = _payfast_signature(params, pp)
-    sb.table("subscriptions").insert({"m_payment_id": pid, "user_id": user["user_id"], "kind": "boost", "status": "pending"}).execute()
-    base = "https://sandbox.payfast.co.za/eng/process" if sandbox else "https://www.payfast.co.za/eng/process"
-    return {"redirect_url": f"{base}?{'&'.join([f'{k}={quote(str(v), safe='')}' for k,v in params.items()])}", "m_payment_id": pid}
-
-@api_router.post("/payments/payfast/boost/activate-sandbox")
-def payfast_boost_activate_sandbox(user: dict = Depends(get_current_user)):
-    if os.environ.get("PAYFAST_SANDBOX","true").lower() != "true": raise HTTPException(400)
-    sb.table("users").update({"ad_tokens": user.get("ad_tokens",0)+3}).eq("user_id", user["user_id"]).execute()
-    return {"ok": True, "tokens": user.get("ad_tokens",0)+3}
-
-# ---------- App wiring ----------
 app.include_router(api_router)
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
     import uvicorn
