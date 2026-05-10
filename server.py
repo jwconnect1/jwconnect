@@ -17,11 +17,12 @@ load_dotenv(ROOT_DIR / '.env')
 SUPABASE_URL = os.environ['SUPABASE_URL']
 SUPABASE_KEY = os.environ['SUPABASE_SERVICE_ROLE_KEY']
 
-# Create a custom HTTP client that forces HTTP/1.1 (no HTTP/2)
-http_client = httpx_lib.Client(http2=False)
+# Create Supabase client normally
+sb: Client = create_client(SUPABASE_URL.rstrip('/'), SUPABASE_KEY)
 
-# Create Supabase client with that custom client
-sb: Client = create_client(SUPABASE_URL.rstrip('/'), SUPABASE_KEY, http_client=http_client)
+# Override the internal httpx client to use HTTP/1.1 (prevents ReadError)
+http_client = httpx_lib.Client(http2=False)
+sb.postgrest.session = http_client
 
 app = FastAPI()
 logging.basicConfig(level=logging.INFO)
