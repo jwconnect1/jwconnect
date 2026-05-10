@@ -400,6 +400,10 @@ def get_location_status(user: dict = Depends(get_current_user)):
 # ---------- Profile ----------
 def get_profile(user: dict) -> dict:
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
+    # ---- NEW: always fetch last_active from the users table ----
+    user_data = _maybe(sb.table("users").select("last_active").eq("user_id", user["user_id"]).maybe_single().execute())
+    last_active = user_data.get("last_active") if user_data else user.get("last_active")
+    # -----------------------------------------------------------
     if not profile:
         return {
             "user_id": user["user_id"], "email": user.get("email",""), "name": user.get("name",""),
@@ -407,7 +411,8 @@ def get_profile(user: dict) -> dict:
             "health_status": None, "latitude": None, "longitude": None,
             "display_name": user.get("name",""), "bio": "", "interests": "", "looking_for": "",
             "education": "", "kids": "", "want_kids": "", "smoke": "", "drink": "", "employment": "",
-            "profile_image": user.get("picture",""), "gallery_images": [],
+            "profile_image": user.get("picture",""),
+            "gallery_images": [],
             "onboarding_complete": False,
             "pref_gender": "", "pref_min_age": 18, "pref_max_age": 99,
             "pref_country": "", "pref_max_distance": 50, "pref_health_status": "",
@@ -415,7 +420,7 @@ def get_profile(user: dict) -> dict:
             "hide_from_health_statuses": "",
             "gps_latitude": None, "gps_longitude": None, "gps_verified_at": None,
             "location_source": "none",
-            "last_active": user.get("last_active"),
+            "last_active": last_active,   # ← changed to use the new variable
         }
     lat = profile.get("gps_latitude")
     lon = profile.get("gps_longitude")
@@ -447,7 +452,7 @@ def get_profile(user: dict) -> dict:
         "gps_latitude": lat, "gps_longitude": lon,
         "gps_verified_at": profile.get("gps_verified_at"),
         "location_source": profile.get("location_source", "none"),
-        "last_active": user.get("last_active"),
+        "last_active": last_active,   # ← changed to use the new variable
     }
 
 @api_router.post("/profile/setup")
