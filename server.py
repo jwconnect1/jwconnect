@@ -241,7 +241,7 @@ def auth_google(payload: GoogleAuthPayload, request: Request, response: Response
         key="session_token",
         value=session_token,
         httponly=True,
-        secure=request.url.scheme == "https",  # secure only on HTTPS
+        secure=request.url.scheme == "https",
         samesite="lax",
         path="/",
         max_age=7*24*60*60
@@ -521,7 +521,6 @@ def get_discover_profiles(user: dict = Depends(get_current_user)):
         partner = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
         matched_ids.add(partner)
     query = sb.table("user_profiles").select("*").neq("user_id", user["user_id"]).eq("onboarding_complete", True)
-    # FIX: correct NULL check
     query = query.not_.is_("gps_latitude", None)
     for mid in matched_ids:
         query = query.neq("user_id", mid)
@@ -608,7 +607,6 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
                 match_id = f"match_{uuid.uuid4().hex[:12]}"
                 sb.table("profile_matches").insert({"match_id": match_id, "user1_id": uid1, "user2_id": uid2, "swipe_type": payload.swipe_type, "created_at": datetime.now(timezone.utc).isoformat()}).execute()
                 matched = True
-                # Send new match notifications to both
                 sb.table("notifications").insert({
                     "notification_id": f"notif_{uuid.uuid4().hex[:12]}",
                     "user_id": payload.swiped_id,
@@ -833,7 +831,7 @@ def build_comment_tree(comments):
         else: roots.append(node)
     return roots
 
-# ---------- Countries/Cities (kept for display) ----------
+# ---------- Countries/Cities ----------
 @api_router.get("/location/countries")
 def get_countries():
     try:
