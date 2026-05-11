@@ -337,6 +337,36 @@ def purchase_premium(tier: str = "gold", user: dict = Depends(get_current_user))
     }).execute()
     return {"ok": True, "premium_tier": tier, "diamonds": new_diamonds, "expires_at": expires.isoformat()}
 
+
+
+# ---------- Earn tokens (balloon game) ----------
+@api_router.post("/earn-tokens")
+def earn_tokens(user: dict = Depends(get_current_user)):
+    # Premium users don't need tokens
+    if is_premium(user):
+        raise HTTPException(400, "Premium members don't earn tokens")
+
+    # Cooldown: once per minute (adjust as needed)
+    last_earn = user.get("last_token_earned")
+    if last_earn:
+        last = _parse_dt(last_earn)
+        if datetime.now(timezone.utc) - last < timedelta(minutes=1):
+            raise HTTPException(400, "You can earn tokens again in a minute")
+
+    # Award 10 tokens
+    new_tokens = user.get("tokens", 0) + 10
+    sb.table("users").update({
+        "tokens": new_tokens,
+        "last_token_earned": datetime.now(timezone.utc).isoformat()
+    }).eq("user_id", user["user_id"]).execute()
+
+    return {"ok": True, "tokens_awarded": 10, "total_tokens": new_tokens}
+
+
+
+
+
+
 # ---------- Location API ----------
 @api_router.post("/location/update")
 async def update_location(payload: LocationUpdatePayload, user: dict = Depends(get_current_user)):
