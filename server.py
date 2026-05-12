@@ -818,6 +818,111 @@ def block_user(payload: BlockPayload, user: dict = Depends(get_current_user)):
     sb.table("profile_matches").delete().or_(f"and(user1_id.eq.{user['user_id']},user2_id.eq.{payload.blocked_user_id}),and(user1_id.eq.{payload.blocked_user_id},user2_id.eq.{user['user_id']})").execute()
     return {"ok": True}
 
+
+
+
+
+# ---------- Flexer Board ----------
+@api_router.post("/flexer/join")
+def flexer_join(amount: int = 6, user: dict = Depends(get_current_user)):
+    if amount < 6:
+        raise HTTPException(400, "Minimum 6 diamonds required to join the Flexer Board")
+    if user.get("diamonds", 0) < amount:
+        raise HTTPException(402, "Not enough diamonds")
+
+    # Check if user already has an active card
+    now = datetime.now(timezone.utc)
+    existing = _maybe(sb.table("flexer_cards").select("*").eq("user_id", user["user_id"]).gt("expires_at", now.isoformat()).maybe_single().execute())
+    
+    new_diamonds = user["diamonds"] - amount
+    if existing:
+        # Renew existing card
+        new_total = existing["diamonds_committed"] + amount
+        new_expiry = max(_parse_dt(existing["expires_at"]), now) + timedelta(days=30)
+        sb.table("flexer_cards").update({
+            "diamonds_committed": new_total,
+            "expires_at": new_expiry.isoformat(),
+            "last_renewed_at": now.isoformat()
+        }).eq("card_id", existing["card_id"]).execute()
+    else:
+        # Create new card
+        card_id = f"flex_{uuid.uuid4().hex[:12]}"
+        expires = now + timedelta(days=30)
+        sb.table("flexer_cards").insert({
+            "card_id": card_id,
+            "user_id": user["user_id"],
+            "diamonds_committed": amount,
+            "created_at": now.isoformat(),
+            "expires_at": expires.isoformat(),
+            "last_renewed_at": now.isoformat()
+        }).execute()
+
+    sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
+    return {"ok": True, "diamonds_spent": amount, "diamonds_remaining": new_diamonds}
+
+@api_router.post("/flexer/increment")
+def flexer_increment(amount: int, user: dict = Depends(get_current_user)):
+    if amount < 1:
+        raise HTTPException(400, "Must add at least 1 diamond")
+    if user.get("diamonds", 0) < amount:
+        raise HTTPException(402, "Not enough diamonds")
+
+    existing = _maybe(sb.table("flexer_cards").select("*").eq("user_id", user["user_id"]).gt("expires_at", datetime.now(timezone.utc).isoformat()).maybe_single().execute())
+    if not existing:
+        raise HTTPException(400, "You need an active Flexer card first")
+
+    # Check card not expired (12 months max from creation)
+    card_age = datetime.now(timezone.utc) - _parse_dt(existing["created_at"])
+    if card_age > timedelta(days=365):
+        raise HTTPException(400, "Card has exceeded 12‑month lifetime. Create a new one.")
+
+    new_total = existing["diamonds_committed"] + amount
+    new_diamonds = user["diamonds"] - amount
+    sb.table("flexer_cards").update({"diamonds_committed": new_total}).eq("card_id", existing["card_id"]).execute()
+    sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
+    return {"ok": True, "total_diamonds": new_total, "diamonds_remaining": new_diamonds}
+
+@api_router.get("/flexer/board")
+def flexer_board(user: dict = Depends(get_current_user)):
+    now = datetime.now(timezone.utc).isoformat()
+    cards = sb.table("flexer_cards").select("*").gt("expires_at", now).order("diamonds_committed", desc=True).limit(100).execute().data or []
+    
+    result = []
+    for card in cards:
+        profile = _maybe(sb.table("user_profiles").select("display_name,profile_image,date_of_birth,country,city,health_status").eq("user_id", card["user_id"]).maybe_single().execute())
+        if profile:
+            age = None
+            if profile.get("date_of_birth"):
+                try:
+                    dob = datetime.fromisoformat(str(profile["date_of_birth"])).date()
+                    today = datetime.now(timezone.utc).date()
+                    age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+                except: pass
+            result.append({
+                "card_id": card["card_id"],
+                "user_id": card["user_id"],
+                "display_name": profile.get("display_name", "Someone"),
+                "profile_image": profile.get("profile_image", ""),
+                "age": age,
+                "country": profile.get("country", ""),
+                "city": profile.get("city", ""),
+                "health_status": profile.get("health_status"),
+                "diamonds_committed": card["diamonds_committed"],
+                "expires_at": card["expires_at"],
+            })
+    return result
+
+
+
+
+
+
+
+
+
+
+
+
 # ---------- Stories ----------
 @api_router.post("/stories")
 def create_story(payload: CreateStoryPayload, user: dict = Depends(get_current_user)):
