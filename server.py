@@ -47,6 +47,11 @@ PREMIUM_COST = 199
 PREMIUM_DAYS = 180
 
 PROFANITY_LIST = {"fuck","shit","bitch","asshole","bastard","dick","pussy","cunt","whore"}
+ETHNICITY_LIST = [
+    "Asian", "Black / African", "Caucasian / White", "Hispanic / Latino",
+    "Middle Eastern", "Native American", "Pacific Islander",
+    "South Asian", "Southeast Asian", "Mixed / Other"
+]
 
 def contains_profanity(text: str) -> bool:
     if not text: return False
@@ -170,11 +175,11 @@ class GoogleAuthPayload(BaseModel):
 
 class ProfileSetupPayload(BaseModel):
     date_of_birth: str; gender: str; health_status: str
-    sexual_orientation: Optional[str] = ""   # new
-    positive_since: Optional[str] = ""        # new
-    height: Optional[str] = ""                # new
-    ethnicity: Optional[str] = ""             # new
-    religion: Optional[str] = ""              # new
+    sexual_orientation: Optional[str] = ""
+    positive_since: Optional[str] = ""
+    height: Optional[str] = ""                # free-text display (e.g., 5'10")
+    ethnicity: Optional[str] = ""             # must be from ETHNICITY_LIST if provided
+    religion: Optional[str] = ""
     display_name: Optional[str] = ""; bio: Optional[str] = ""
     interests: Optional[str] = ""; looking_for: Optional[str] = ""
     education: Optional[str] = ""; kids: Optional[str] = ""
@@ -190,11 +195,11 @@ class ProfileSetupPayload(BaseModel):
 
 class ProfileUpdatePayload(BaseModel):
     date_of_birth: Optional[str] = None; gender: Optional[str] = None; health_status: Optional[str] = None
-    sexual_orientation: Optional[str] = None   # new
-    positive_since: Optional[str] = None        # new
-    height: Optional[str] = None                # new
-    ethnicity: Optional[str] = None             # new
-    religion: Optional[str] = None              # new
+    sexual_orientation: Optional[str] = None
+    positive_since: Optional[str] = None
+    height: Optional[str] = None
+    ethnicity: Optional[str] = None
+    religion: Optional[str] = None
     display_name: Optional[str] = None; bio: Optional[str] = None; interests: Optional[str] = None
     looking_for: Optional[str] = None; education: Optional[str] = None; kids: Optional[str] = None
     want_kids: Optional[str] = None; smoke: Optional[str] = None; drink: Optional[str] = None
@@ -235,6 +240,8 @@ def get_current_user(
     if _parse_dt(session["expires_at"]) < datetime.now(timezone.utc): raise HTTPException(status_code=401)
     user = _maybe(sb.table("users").select("*").eq("user_id", session["user_id"]).maybe_single().execute())
     if not user: raise HTTPException(status_code=401, detail="User not found")
+    if user.get("deleted"):
+        raise HTTPException(status_code=401, detail="Account deleted")
 
     # Auto‑renew / expiry check
     old_tier = user.get("premium_tier")
@@ -274,18 +281,26 @@ def api_root():
 def auth_google(payload: GoogleAuthPayload, request: Request, response: Response):
     email, name, picture = payload.email, payload.name, payload.picture
     session_token = f"session_{uuid.uuid4().hex[:32]}"
-    existing = _maybe(sb.table("users").select("*").eq("email", email).maybe_single().execute())
+    # Look for existing user who is NOT deleted
+    existing = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute())
     now_iso = datetime.now(timezone.utc).isoformat()
     if existing:
         user_id = existing["user_id"]
-        sb.table("users").update({"name": name, "picture": picture, "last_active": now_iso}).eq("user_id", user_id).execute()
+        # Reactivate if somehow marked deleted (shouldn't happen with above filter, but just in case)
+        sb.table("users").update({"name": name, "picture": picture, "last_active": now_iso, "deleted": False}).eq("user_id", user_id).execute()
     else:
-        user_id = f"user_{uuid.uuid4().hex[:12]}"
-        sb.table("users").insert({
-            "user_id": user_id, "email": email, "name": name, "picture": picture,
-            "created_at": now_iso, "last_active": now_iso,
-            "tokens": 15, "diamonds": 5, "verified": False
-        }).execute()
+        # Check if there's a deleted account with this email – reactivate it instead of creating new
+        deleted_user = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", True).maybe_single().execute())
+        if deleted_user:
+            user_id = deleted_user["user_id"]
+            sb.table("users").update({"name": name, "picture": picture, "last_active": now_iso, "deleted": False}).eq("user_id", user_id).execute()
+        else:
+            user_id = f"user_{uuid.uuid4().hex[:12]}"
+            sb.table("users").insert({
+                "user_id": user_id, "email": email, "name": name, "picture": picture,
+                "created_at": now_iso, "last_active": now_iso,
+                "tokens": 15, "diamonds": 5, "verified": False
+            }).execute()
     expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     sb.table("user_sessions").upsert({"session_token": session_token, "user_id": user_id, "expires_at": expires_at.isoformat(), "created_at": now_iso}).execute()
     response.set_cookie(key="session_token", value=session_token, httponly=True, secure=request.url.scheme == "https", samesite="lax", path="/", max_age=7*24*60*60)
@@ -325,6 +340,29 @@ def auth_logout(response: Response, session_token_cookie: Optional[str] = Cookie
     if token: sb.table("user_sessions").delete().eq("session_token", token).execute()
     response.delete_cookie(key="session_token", path="/", samesite="lax", secure=False)
     return {"ok": True}
+
+@api_router.delete("/auth/me")
+def delete_account(user: dict = Depends(get_current_user)):
+    """Soft-delete account: mark deleted, clear sessions, anonymise profile"""
+    sb.table("users").update({"deleted": True}).eq("user_id", user["user_id"]).execute()
+    sb.table("user_sessions").delete().eq("user_id", user["user_id"]).execute()
+    # Anonymise profile data
+    sb.table("user_profiles").update({
+        "display_name": None,
+        "bio": None,
+        "date_of_birth": None,
+        "profile_image": None,
+        "gallery_images": None,
+        "gps_latitude": None,
+        "gps_longitude": None,
+        "gps_verified_at": None,
+    }).eq("user_id", user["user_id"]).execute()
+    return {"ok": True, "message": "Account deleted"}
+
+# ---------- Lookup endpoints (for frontend dropdowns) ----------
+@api_router.get("/lookup/ethnicities")
+def get_ethnicities():
+    return ETHNICITY_LIST
 
 # ---------- Economy ----------
 @api_router.post("/purchase/verify")
@@ -488,6 +526,9 @@ def get_profile(user: dict) -> dict:
 
 @api_router.post("/profile/setup")
 def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
+    # Optional ethnicity validation
+    if payload.ethnicity and payload.ethnicity not in ETHNICITY_LIST:
+        raise HTTPException(400, f"Ethnicity must be one of: {', '.join(ETHNICITY_LIST)}")
     existing_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     lat = existing_profile.get("gps_latitude") if existing_profile else None
     lon = existing_profile.get("gps_longitude") if existing_profile else None
@@ -549,7 +590,10 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
     ]
     for field in all_fields:
         value = getattr(payload, field, None)
-        if value is not None: updates[field] = value
+        if value is not None:
+            if field == "ethnicity" and value not in ETHNICITY_LIST:
+                raise HTTPException(400, f"Ethnicity must be one of: {', '.join(ETHNICITY_LIST)}")
+            updates[field] = value
     if payload.profile_hidden is not None:
         if not is_premium(user):
             updates["profile_hidden"] = False
@@ -579,30 +623,51 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
 
-# ---------- Discovery ----------
+# ---------- Discovery (with pagination and filter overrides) ----------
 @api_router.get("/discover/profiles")
-def get_discover_profiles(user: dict = Depends(get_current_user)):
+def get_discover_profiles(
+    user: dict = Depends(get_current_user),
+    page: Optional[int] = None,
+    limit: Optional[int] = None,
+    gender: Optional[str] = None,
+    health_status: Optional[str] = None,
+    min_age: Optional[int] = None,
+    max_age: Optional[int] = None,
+    country: Optional[str] = None,
+    max_distance: Optional[int] = None,
+):
     viewer_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     if not viewer_profile: return []
     my_lat = viewer_profile.get("gps_latitude") or viewer_profile.get("latitude")
     my_lon = viewer_profile.get("gps_longitude") or viewer_profile.get("longitude")
     if my_lat is None or my_lon is None: return []
-    pref_gender = viewer_profile.get("pref_gender",""); pref_min_age = viewer_profile.get("pref_min_age",18)
-    pref_max_age = viewer_profile.get("pref_max_age",99); pref_country = viewer_profile.get("pref_country","")
-    pref_max_distance = viewer_profile.get("pref_max_distance",50); pref_health_status = viewer_profile.get("pref_health_status","")
+
+    # Use provided filters or fallback to saved preferences
+    pref_gender = gender if gender is not None else viewer_profile.get("pref_gender", "")
+    pref_health = health_status if health_status is not None else viewer_profile.get("pref_health_status", "")
+    pref_min_age = min_age if min_age is not None else viewer_profile.get("pref_min_age", 18)
+    pref_max_age = max_age if max_age is not None else viewer_profile.get("pref_max_age", 99)
+    pref_country = country if country is not None else viewer_profile.get("pref_country", "")
+    pref_max_distance = max_distance if max_distance is not None else viewer_profile.get("pref_max_distance", 50)
+
     today = datetime.now(timezone.utc).date()
     matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").execute()
     matched_ids = set()
     for m in (matches.data or []):
         partner = m["user2_id"] if m["user1_id"] == user["user_id"] else m["user1_id"]
         matched_ids.add(partner)
+
     query = sb.table("user_profiles").select("*").neq("user_id", user["user_id"]).eq("onboarding_complete", True)
     query = query.not_.is_("gps_latitude", None)
-    for mid in matched_ids: query = query.neq("user_id", mid)
-    profiles = (query.limit(200).execute()).data or []
-    if not profiles: return []
+    for mid in matched_ids:
+        query = query.neq("user_id", mid)
 
-    # Fetch user statuses (verified, premium_tier) in one batch
+    # Fetch all potential profiles (we'll filter in Python)
+    profiles = (query.limit(1000).execute()).data or []
+    if not profiles:
+        return []
+
+    # Batch fetch user statuses
     user_ids = [p["user_id"] for p in profiles]
     users_data = sb.table("users").select("user_id,verified,premium_tier").in_("user_id", user_ids).execute().data or []
     user_status = {u["user_id"]: u for u in users_data}
@@ -610,20 +675,40 @@ def get_discover_profiles(user: dict = Depends(get_current_user)):
     filtered = []
     for p in profiles:
         if p.get("profile_hidden"): continue
-        # age, gender, distance filters...
+        # Age filter
+        if p.get("date_of_birth"):
+            try:
+                dob = datetime.fromisoformat(str(p["date_of_birth"])).date()
+                age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+                if age < pref_min_age or age > pref_max_age: continue
+            except: pass
+        # Gender filter
+        if pref_gender and p.get("gender") != pref_gender: continue
+        # Health status filter
+        if pref_health and p.get("health_status") != pref_health: continue
+        # Country filter
+        if pref_country and p.get("country") != pref_country: continue
+        # Distance filter
         p_lat = p.get("gps_latitude"); p_lon = p.get("gps_longitude")
         distance = None
         if p_lat is not None and p_lon is not None:
             distance = haversine(my_lat, my_lon, p_lat, p_lon)
             if pref_max_distance and distance > pref_max_distance: continue
         p["distance_km"] = round(distance, 1) if distance is not None else None
-        # Attach user status
         status = user_status.get(p["user_id"], {})
         p["verified"] = status.get("verified", False)
         p["premium_tier"] = status.get("premium_tier")
         filtered.append(p)
+
     random.shuffle(filtered)
-    return filtered[:50]
+
+    # Pagination
+    if page is not None and limit is not None:
+        start = (page - 1) * limit
+        end = start + limit
+        return filtered[start:end]
+    else:
+        return filtered[:50]  # default limit for swiping
 
 @api_router.post("/discover/swipe")
 def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
@@ -821,7 +906,7 @@ def mark_notifications_read(user: dict = Depends(get_current_user)):
     sb.table("notifications").update({"read": True}).eq("user_id", user["user_id"]).eq("read", False).execute()
     return {"ok": True}
 
-# ---------- Report / Block (unchanged) ----------
+# ---------- Report / Block ----------
 @api_router.post("/report")
 def report_user(payload: ReportPayload, user: dict = Depends(get_current_user)):
     existing = _maybe(sb.table("user_reports").select("report_id").eq("reporter_id", user["user_id"]).eq("reported_user_id", payload.reported_user_id).maybe_single().execute())
@@ -837,7 +922,7 @@ def block_user(payload: BlockPayload, user: dict = Depends(get_current_user)):
     sb.table("profile_matches").delete().or_(f"and(user1_id.eq.{user['user_id']},user2_id.eq.{payload.blocked_user_id}),and(user1_id.eq.{payload.blocked_user_id},user2_id.eq.{user['user_id']})").execute()
     return {"ok": True}
 
-# ---------- Stories (unchanged) ----------
+# ---------- Stories ----------
 @api_router.post("/stories")
 def create_story(payload: CreateStoryPayload, user: dict = Depends(get_current_user)):
     if not user.get("verified"):
@@ -908,6 +993,28 @@ def create_comment(story_id: str, payload: CreateCommentPayload, user: dict = De
         pc = _maybe(sb.table("story_comments").select("reply_count").eq("comment_id", payload.parent_id).maybe_single().execute())
         if pc: sb.table("story_comments").update({"reply_count": pc.get("reply_count",0)+1}).eq("comment_id", payload.parent_id).execute()
     return {"ok": True, "comment": comment}
+
+@api_router.put("/stories/{story_id}/comments/{comment_id}")
+def edit_comment(story_id: str, comment_id: str, payload: CreateCommentPayload, user: dict = Depends(get_current_user)):
+    comment = _maybe(sb.table("story_comments").select("*").eq("comment_id", comment_id).eq("story_id", story_id).maybe_single().execute())
+    if not comment: raise HTTPException(404, "Comment not found")
+    if comment["user_id"] != user["user_id"]: raise HTTPException(403, "Not your comment")
+    if contains_profanity(payload.content): raise HTTPException(400, "Comment contains inappropriate language")
+    sb.table("story_comments").update({"content": payload.content}).eq("comment_id", comment_id).execute()
+    return {"ok": True}
+
+@api_router.delete("/stories/{story_id}/comments/{comment_id}")
+def delete_comment(story_id: str, comment_id: str, user: dict = Depends(get_current_user)):
+    comment = _maybe(sb.table("story_comments").select("*").eq("comment_id", comment_id).eq("story_id", story_id).maybe_single().execute())
+    if not comment: raise HTTPException(404, "Comment not found")
+    if comment["user_id"] != user["user_id"]: raise HTTPException(403, "Not your comment")
+    sb.table("story_comments").delete().eq("comment_id", comment_id).execute()
+    # Update comment count (decrement, but not below 0)
+    story = _maybe(sb.table("stories").select("comment_count").eq("story_id", story_id).maybe_single().execute())
+    if story:
+        new_count = max(0, story.get("comment_count", 0) - 1)
+        sb.table("stories").update({"comment_count": new_count}).eq("story_id", story_id).execute()
+    return {"ok": True}
 
 @api_router.put("/stories/{story_id}")
 def edit_story(story_id: str, payload: CreateStoryPayload, user: dict = Depends(get_current_user)):
@@ -1011,8 +1118,6 @@ def get_cities(country:str):
     return [{"name":c} for c in fallback.get(country,[])]
 
 app.include_router(api_router)
-
-
 
 if __name__ == "__main__":
     import uvicorn
