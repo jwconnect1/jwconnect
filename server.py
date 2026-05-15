@@ -192,6 +192,8 @@ class ProfileSetupPayload(BaseModel):
     profile_hidden: Optional[bool] = False
     hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
     hide_from_health_statuses: Optional[str] = ""
+    visible_to: Optional[str] = "all"           # "all" or "verified_only"
+    pref_sexual_orientation: Optional[str] = ""
 
 class ProfileUpdatePayload(BaseModel):
     date_of_birth: Optional[str] = None; gender: Optional[str] = None; health_status: Optional[str] = None
@@ -211,6 +213,8 @@ class ProfileUpdatePayload(BaseModel):
     profile_hidden: Optional[bool] = None
     hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
     hide_from_health_statuses: Optional[str] = None
+    visible_to: Optional[str] = None
+    pref_sexual_orientation: Optional[str] = None
 
 class CreateStoryPayload(BaseModel):
     content: str; category: str; title: Optional[str] = ""
@@ -281,15 +285,12 @@ def api_root():
 def auth_google(payload: GoogleAuthPayload, request: Request, response: Response):
     email, name, picture = payload.email, payload.name, payload.picture
     session_token = f"session_{uuid.uuid4().hex[:32]}"
-    # Look for existing user who is NOT deleted
     existing = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", False).maybe_single().execute())
     now_iso = datetime.now(timezone.utc).isoformat()
     if existing:
         user_id = existing["user_id"]
-        # Reactivate if somehow marked deleted (shouldn't happen with above filter, but just in case)
         sb.table("users").update({"name": name, "picture": picture, "last_active": now_iso, "deleted": False}).eq("user_id", user_id).execute()
     else:
-        # Check if there's a deleted account with this email – reactivate it instead of creating new
         deleted_user = _maybe(sb.table("users").select("*").eq("email", email).eq("deleted", True).maybe_single().execute())
         if deleted_user:
             user_id = deleted_user["user_id"]
@@ -343,23 +344,16 @@ def auth_logout(response: Response, session_token_cookie: Optional[str] = Cookie
 
 @api_router.delete("/auth/me")
 def delete_account(user: dict = Depends(get_current_user)):
-    """Soft-delete account: mark deleted, clear sessions, anonymise profile"""
     sb.table("users").update({"deleted": True}).eq("user_id", user["user_id"]).execute()
     sb.table("user_sessions").delete().eq("user_id", user["user_id"]).execute()
-    # Anonymise profile data
     sb.table("user_profiles").update({
-        "display_name": None,
-        "bio": None,
-        "date_of_birth": None,
-        "profile_image": None,
-        "gallery_images": None,
-        "gps_latitude": None,
-        "gps_longitude": None,
-        "gps_verified_at": None,
+        "display_name": None, "bio": None, "date_of_birth": None,
+        "profile_image": None, "gallery_images": None,
+        "gps_latitude": None, "gps_longitude": None, "gps_verified_at": None,
     }).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "message": "Account deleted"}
 
-# ---------- Lookup endpoints (for frontend dropdowns) ----------
+# ---------- Lookup endpoints ----------
 @api_router.get("/lookup/ethnicities")
 def get_ethnicities():
     return ETHNICITY_LIST
@@ -396,7 +390,7 @@ def toggle_auto_renew(user: dict = Depends(get_current_user)):
     sb.table("users").update({"auto_renew": new_val}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "auto_renew": new_val}
 
-# ---------- Earn tokens (balloon game) ----------
+# ---------- Earn tokens ----------
 @api_router.post("/earn-tokens")
 def earn_tokens(user: dict = Depends(get_current_user)):
     if is_premium(user):
@@ -410,7 +404,7 @@ def earn_tokens(user: dict = Depends(get_current_user)):
     sb.table("users").update({"tokens": new_tokens, "last_token_earned": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "tokens_awarded": 10, "total_tokens": new_tokens}
 
-# ---------- Location API (unchanged) ----------
+# ---------- Location API ----------
 @api_router.post("/location/update")
 async def update_location(payload: LocationUpdatePayload, user: dict = Depends(get_current_user)):
     if not (-90 <= payload.latitude <= 90) or not (-180 <= payload.longitude <= 180):
@@ -483,7 +477,8 @@ def get_profile(user: dict) -> dict:
             "gps_latitude": None, "gps_longitude": None, "gps_verified_at": None,
             "location_source": "none",
             "last_active": user.get("last_active"),
-            "verified": False, "premium_tier": None
+            "verified": False, "premium_tier": None,
+            "visible_to": "all", "pref_sexual_orientation": ""
         }
     lat = profile.get("gps_latitude"); lon = profile.get("gps_longitude")
     country = profile.get("country") if lat is not None else None
@@ -521,14 +516,18 @@ def get_profile(user: dict) -> dict:
         "location_source": profile.get("location_source", "none"),
         "last_active": user.get("last_active"),
         "verified": user.get("verified", False),
-        "premium_tier": user.get("premium_tier")
+        "premium_tier": user.get("premium_tier"),
+        "visible_to": profile.get("visible_to", "all"),
+        "pref_sexual_orientation": profile.get("pref_sexual_orientation", ""),
     }
 
 @api_router.post("/profile/setup")
 def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
-    # Optional ethnicity validation
     if payload.ethnicity and payload.ethnicity not in ETHNICITY_LIST:
         raise HTTPException(400, f"Ethnicity must be one of: {', '.join(ETHNICITY_LIST)}")
+    # Restrict visibility setting to verified users
+    if payload.visible_to == "verified_only" and not user.get("verified"):
+        raise HTTPException(400, "Only verified users can restrict visibility to verified members")
     existing_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     lat = existing_profile.get("gps_latitude") if existing_profile else None
     lon = existing_profile.get("gps_longitude") if existing_profile else None
@@ -561,6 +560,8 @@ def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current
         "profile_hidden": payload.profile_hidden,
         "hide_from_min_age": payload.hide_from_min_age, "hide_from_max_age": payload.hide_from_max_age,
         "hide_from_health_statuses": payload.hide_from_health_statuses or "",
+        "visible_to": payload.visible_to or "all",
+        "pref_sexual_orientation": payload.pref_sexual_orientation or "",
         "onboarding_complete": True,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -586,13 +587,16 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
         "education", "kids", "want_kids", "smoke", "drink", "employment",
         "pref_gender", "pref_min_age", "pref_max_age", "pref_country",
         "pref_max_distance", "pref_health_status",
-        "hide_from_min_age", "hide_from_max_age", "hide_from_health_statuses"
+        "hide_from_min_age", "hide_from_max_age", "hide_from_health_statuses",
+        "visible_to", "pref_sexual_orientation"
     ]
     for field in all_fields:
         value = getattr(payload, field, None)
         if value is not None:
             if field == "ethnicity" and value not in ETHNICITY_LIST:
                 raise HTTPException(400, f"Ethnicity must be one of: {', '.join(ETHNICITY_LIST)}")
+            if field == "visible_to" and value == "verified_only" and not user.get("verified"):
+                raise HTTPException(400, "Only verified users can restrict visibility to verified members")
             updates[field] = value
     if payload.profile_hidden is not None:
         if not is_premium(user):
@@ -623,7 +627,7 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
 
-# ---------- Discovery (with pagination and filter overrides) ----------
+# ---------- Discovery (with token charge, visibility filter, sexual orientation filter) ----------
 @api_router.get("/discover/profiles")
 def get_discover_profiles(
     user: dict = Depends(get_current_user),
@@ -635,20 +639,24 @@ def get_discover_profiles(
     max_age: Optional[int] = None,
     country: Optional[str] = None,
     max_distance: Optional[int] = None,
+    sexual_orientation: Optional[str] = None,
 ):
+    # Charge 1 token for non-premium users to access discovery
+    require_token(user, 1)
+
     viewer_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     if not viewer_profile: return []
     my_lat = viewer_profile.get("gps_latitude") or viewer_profile.get("latitude")
     my_lon = viewer_profile.get("gps_longitude") or viewer_profile.get("longitude")
     if my_lat is None or my_lon is None: return []
 
-    # Use provided filters or fallback to saved preferences
     pref_gender = gender if gender is not None else viewer_profile.get("pref_gender", "")
     pref_health = health_status if health_status is not None else viewer_profile.get("pref_health_status", "")
     pref_min_age = min_age if min_age is not None else viewer_profile.get("pref_min_age", 18)
     pref_max_age = max_age if max_age is not None else viewer_profile.get("pref_max_age", 99)
     pref_country = country if country is not None else viewer_profile.get("pref_country", "")
     pref_max_distance = max_distance if max_distance is not None else viewer_profile.get("pref_max_distance", 50)
+    pref_sexual_orientation = sexual_orientation if sexual_orientation is not None else viewer_profile.get("pref_sexual_orientation", "")
 
     today = datetime.now(timezone.utc).date()
     matches = sb.table("profile_matches").select("*").or_(f"user1_id.eq.{user['user_id']},user2_id.eq.{user['user_id']}").execute()
@@ -662,12 +670,10 @@ def get_discover_profiles(
     for mid in matched_ids:
         query = query.neq("user_id", mid)
 
-    # Fetch all potential profiles (we'll filter in Python)
     profiles = (query.limit(1000).execute()).data or []
     if not profiles:
         return []
 
-    # Batch fetch user statuses
     user_ids = [p["user_id"] for p in profiles]
     users_data = sb.table("users").select("user_id,verified,premium_tier").in_("user_id", user_ids).execute().data or []
     user_status = {u["user_id"]: u for u in users_data}
@@ -675,6 +681,9 @@ def get_discover_profiles(
     filtered = []
     for p in profiles:
         if p.get("profile_hidden"): continue
+        # Visibility check: if target profile is visible only to verified users, and viewer is not verified, skip
+        if p.get("visible_to") == "verified_only" and not user.get("verified"):
+            continue
         # Age filter
         if p.get("date_of_birth"):
             try:
@@ -688,6 +697,8 @@ def get_discover_profiles(
         if pref_health and p.get("health_status") != pref_health: continue
         # Country filter
         if pref_country and p.get("country") != pref_country: continue
+        # Sexual orientation filter
+        if pref_sexual_orientation and p.get("sexual_orientation") != pref_sexual_orientation: continue
         # Distance filter
         p_lat = p.get("gps_latitude"); p_lon = p.get("gps_longitude")
         distance = None
@@ -702,13 +713,12 @@ def get_discover_profiles(
 
     random.shuffle(filtered)
 
-    # Pagination
     if page is not None and limit is not None:
         start = (page - 1) * limit
         end = start + limit
         return filtered[start:end]
     else:
-        return filtered[:50]  # default limit for swiping
+        return filtered[:50]
 
 @api_router.post("/discover/swipe")
 def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
@@ -754,6 +764,15 @@ def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user))
                 notify_user(user["user_id"], "match_new", f"You matched with {from_profile.get('display_name', 'Someone')}!", payload.swiped_id)
             else: match_id = exist_match["match_id"]
     return {"ok": True, "matched": matched, "match_id": match_id, "direction": payload.direction}
+
+# ---------- Random Chat token charge ----------
+@api_router.post("/chat/start")
+def chat_start(user: dict = Depends(get_current_user)):
+    require_token(user, 1)
+    return {"ok": True}
+
+# The rest of the file remains unchanged (matches, messages, stories, flexer, etc.)
+# ... (include all other routes exactly as before, no further modifications needed)
 
 @api_router.get("/discover/matches")
 def get_matches(swipe_type: Optional[str] = 'dating', user: dict = Depends(get_current_user)):
@@ -1009,7 +1028,6 @@ def delete_comment(story_id: str, comment_id: str, user: dict = Depends(get_curr
     if not comment: raise HTTPException(404, "Comment not found")
     if comment["user_id"] != user["user_id"]: raise HTTPException(403, "Not your comment")
     sb.table("story_comments").delete().eq("comment_id", comment_id).execute()
-    # Update comment count (decrement, but not below 0)
     story = _maybe(sb.table("stories").select("comment_count").eq("story_id", story_id).maybe_single().execute())
     if story:
         new_count = max(0, story.get("comment_count", 0) - 1)
