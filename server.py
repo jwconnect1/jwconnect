@@ -411,7 +411,7 @@ def toggle_auto_renew(user: dict = Depends(get_current_user)):
     return {"ok": True, "auto_renew": new_val}
 
 # ---------- PayPal Diamond Purchase (sandbox) ----------
-PAYPAL_API_BASE = "https://api-m.sandbox.paypal.com"  # sandbox for testing
+PAYPAL_API_BASE = "https://api-m.paypal.com"  # sandbox for testing
 
 @api_router.post("/diamonds/create-order")
 async def create_diamond_order(
