@@ -36,15 +36,14 @@ app.add_middleware(
 
 api_router = APIRouter(prefix="/api")
 
-# ---------- Simple in‑memory rate limiter (no extra deps) ----------
+# ---------- Simple in‑memory rate limiter ----------
 RATE_LIMIT_WINDOW = 60  # seconds
 RATE_LIMIT_MAX = 10     # requests per window
-rate_limit_store: Dict[str, list] = {}  # key -> list of timestamps
+rate_limit_store: Dict[str, list] = {}
 
 def check_rate_limit(key: str, max_req: int = RATE_LIMIT_MAX, window: int = RATE_LIMIT_WINDOW):
     now = time.time()
     timestamps = rate_limit_store.get(key, [])
-    # remove old entries
     timestamps = [t for t in timestamps if now - t < window]
     if len(timestamps) >= max_req:
         raise HTTPException(429, "Too many requests. Please slow down.")
@@ -125,7 +124,6 @@ async def get_location_from_ip(ip: str) -> dict:
 
 # ---------- Image Helpers (WebP) ----------
 def compress_image(base64_str: str, max_size_kb: int = 300) -> bytes:
-    # Size check before decoding
     if len(base64_str) > MAX_IMAGE_BASE64_SIZE:
         raise HTTPException(400, "Image too large (max 5 MB)")
     if "," in base64_str: base64_str = base64_str.split(",", 1)[1]
@@ -151,7 +149,6 @@ def upload_image_to_supabase(file_bytes: bytes, user_id: str, filename: str) -> 
 def process_image_field(image_value: str, user_id: str, filename_prefix: str) -> str:
     if not image_value: return image_value
     if image_value.startswith("data:image") or (len(image_value) > 1000 and "base64" in image_value):
-        # Validate length before processing
         if len(image_value) > MAX_IMAGE_BASE64_SIZE:
             raise HTTPException(400, "Image too large (max 5 MB)")
         try:
@@ -217,7 +214,7 @@ class ProfileSetupPayload(BaseModel):
     profile_hidden: Optional[bool] = False
     hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
     hide_from_health_statuses: Optional[str] = ""
-    visible_to: Optional[str] = "all"           # "all" or "verified_only"
+    visible_to: Optional[str] = "all"
     lock_all_images: Optional[bool] = False
 
 class ProfileUpdatePayload(BaseModel):
@@ -557,7 +554,7 @@ async def capture_diamond_order(
 
     return {"ok": True, "diamonds": new_diamonds}
 
-# ---------- Earn tokens ----------
+# ---------- Earn tokens (game) ----------
 @api_router.post("/earn-tokens")
 def earn_tokens(user: dict = Depends(get_current_user)):
     if is_premium(user):
@@ -567,11 +564,23 @@ def earn_tokens(user: dict = Depends(get_current_user)):
         last = _parse_dt(last_earn)
         if datetime.now(timezone.utc) - last < timedelta(minutes=1):
             raise HTTPException(400, "You can earn tokens again in a minute")
-    new_tokens = user.get("tokens", 0) + 15            # <-- changed from 10 to 15
+    new_tokens = user.get("tokens", 0) + 15
     sb.table("users").update({"tokens": new_tokens, "last_token_earned": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
-    return {"ok": True, "tokens_awarded": 15, "total_tokens": new_tokens}   # <-- changed
+    return {"ok": True, "tokens_awarded": 15, "total_tokens": new_tokens}
 
-
+# ---------- Earn tokens from ad (button) ----------
+@api_router.post("/earn-tokens-ad")
+def earn_tokens_ad(user: dict = Depends(get_current_user)):
+    if is_premium(user):
+        raise HTTPException(400, "Premium members don't earn tokens")
+    last_earn = user.get("last_ad_token_earned")
+    if last_earn:
+        last = _parse_dt(last_earn)
+        if datetime.now(timezone.utc) - last < timedelta(seconds=30):
+            raise HTTPException(400, "You can earn ad tokens again in 30 seconds")
+    new_tokens = user.get("tokens", 0) + 2
+    sb.table("users").update({"tokens": new_tokens, "last_ad_token_earned": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
+    return {"ok": True, "tokens_awarded": 2, "total_tokens": new_tokens}
 
 # ---------- Location API ----------
 @api_router.post("/location/update")
@@ -805,7 +814,7 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
 
-# ---------- Discovery (optimised – DB‑level filters + proper pagination) ----------
+# ---------- Discovery (optimised) ----------
 @api_router.get("/discover/profiles")
 def get_discover_profiles(
     user: dict = Depends(get_current_user),
@@ -833,7 +842,6 @@ def get_discover_profiles(
     pref_max_distance = max_distance if max_distance is not None else viewer_profile.get("pref_max_distance", 50)
     pref_sexual_orientation = sexual_orientation if sexual_orientation is not None else viewer_profile.get("pref_sexual_orientation", "")
 
-    # Calculate age range dates
     today = datetime.now(timezone.utc).date()
     min_birth_date = today.replace(year=today.year - pref_max_age)
     max_birth_date = today.replace(year=today.year - pref_min_age)
@@ -868,7 +876,6 @@ def get_discover_profiles(
     for mid in matched_ids:
         query = query.neq("user_id", mid)
 
-    # Pagination
     if page is not None and limit is not None:
         start = (page - 1) * limit
         end = start + limit - 1
@@ -880,12 +887,10 @@ def get_discover_profiles(
     if not profiles:
         return []
 
-    # Batch fetch user statuses
     user_ids = [p["user_id"] for p in profiles]
     users_data = sb.table("users").select("user_id,verified,premium_tier").in_("user_id", user_ids).execute().data or []
     user_status = {u["user_id"]: u for u in users_data}
 
-    # Filter by distance (must do in Python because it's a calculation)
     filtered = []
     for p in profiles:
         if p.get("profile_hidden"): continue
