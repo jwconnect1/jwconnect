@@ -334,7 +334,18 @@ def auth_me(user: dict = Depends(get_current_user)):
         "premium_tier": user.get("premium_tier"),
         "premium_expires_at": user.get("premium_expires_at"),
         "auto_renew": user.get("auto_renew", False),
+        "privacy_accepted": user.get("privacy_accepted_at") is not None,
     }
+
+
+@api_router.post("/accept-privacy")
+def accept_privacy(user: dict = Depends(get_current_user)):
+    now = datetime.now(timezone.utc).isoformat()
+    sb.table("users").update({"privacy_accepted_at": now}).eq("user_id", user["user_id"]).execute()
+    return {"ok": True}
+
+
+
 
 @api_router.post("/auth/logout")
 def auth_logout(response: Response, session_token_cookie: Optional[str] = Cookie(default=None, alias="session_token"), authorization: Optional[str] = Header(default=None)):
@@ -402,6 +413,8 @@ def toggle_auto_renew(user: dict = Depends(get_current_user)):
     new_val = not current
     sb.table("users").update({"auto_renew": new_val}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "auto_renew": new_val}
+
+
 
 # ---------- Earn tokens ----------
 @api_router.post("/earn-tokens")
