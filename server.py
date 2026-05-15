@@ -11,11 +11,6 @@ from datetime import datetime, timezone, timedelta
 from PIL import Image
 import httpx as httpx_lib
 
-import os
-import httpx
-
-
-
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
@@ -342,15 +337,11 @@ def auth_me(user: dict = Depends(get_current_user)):
         "privacy_accepted": user.get("privacy_accepted_at") is not None,
     }
 
-
 @api_router.post("/accept-privacy")
 def accept_privacy(user: dict = Depends(get_current_user)):
     now = datetime.now(timezone.utc).isoformat()
     sb.table("users").update({"privacy_accepted_at": now}).eq("user_id", user["user_id"]).execute()
     return {"ok": True}
-
-
-
 
 @api_router.post("/auth/logout")
 def auth_logout(response: Response, session_token_cookie: Optional[str] = Cookie(default=None, alias="session_token"), authorization: Optional[str] = Header(default=None)):
@@ -419,7 +410,6 @@ def toggle_auto_renew(user: dict = Depends(get_current_user)):
     sb.table("users").update({"auto_renew": new_val}).eq("user_id", user["user_id"]).execute()
     return {"ok": True, "auto_renew": new_val}
 
-
 # ---------- PayPal Diamond Purchase (sandbox) ----------
 PAYPAL_API_BASE = "https://api-m.sandbox.paypal.com"  # sandbox for testing
 
@@ -429,7 +419,6 @@ async def create_diamond_order(
     request: Request,
     user: dict = Depends(get_current_user)
 ):
-    # Define packages
     packages = {
         "60": {"diamonds": 60, "amount": 50.00, "zar": "R50"},
         "120": {"diamonds": 120, "amount": 100.00, "zar": "R100"},
@@ -441,11 +430,12 @@ async def create_diamond_order(
 
     pkg = packages[package_id]
 
-    # Your sandbox credentials (replace with live later)
-    PAYPAL_CLIENT_ID = "AbbNBFQMlU_9el7alMGRz..."  # full client ID
-    PAYPAL_CLIENT_SECRET = "your-sandbox-secret"     # full secret from dashboard
+    # Read credentials from environment variables (set these in Render)
+    PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID")
+    PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_CLIENT_SECRET")
+    if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
+        raise HTTPException(500, "PayPal credentials not configured")
 
-    # Get PayPal access token
     auth_response = await httpx.AsyncClient().post(
         f"{PAYPAL_API_BASE}/v1/oauth2/token",
         data={"grant_type": "client_credentials"},
@@ -457,7 +447,6 @@ async def create_diamond_order(
 
     access_token = auth_response.json()["access_token"]
 
-    # Create order
     order_data = {
         "intent": "CAPTURE",
         "purchase_units": [{
@@ -490,17 +479,17 @@ async def create_diamond_order(
 
     return order_response.json()
 
-
 @api_router.post("/diamonds/capture-order")
 async def capture_diamond_order(
     order_id: str,
     package_id: str,
     user: dict = Depends(get_current_user)
 ):
-    PAYPAL_CLIENT_ID = "AT0fK5UyZpc-12_eyI8TfSbAM_-Ryzc4uvLhfezdbC3ZFpFBWQ1OArGqMQeIALMj0JXHjf3RoyMhhLCJ"  # full client ID
-    PAYPAL_CLIENT_SECRET = "EHuRm89xfNvVGDzPjXZlWkdvcQS26VSzYbR9JuKnLgu44pU3Q_2fY_e51c0Gfq9yg9O_ViFsU__oG_zs"     # full secret
+    PAYPAL_CLIENT_ID = os.environ.get("PAYPAL_CLIENT_ID")
+    PAYPAL_CLIENT_SECRET = os.environ.get("PAYPAL_CLIENT_SECRET")
+    if not PAYPAL_CLIENT_ID or not PAYPAL_CLIENT_SECRET:
+        raise HTTPException(500, "PayPal credentials not configured")
 
-    # Get access token
     auth_response = await httpx.AsyncClient().post(
         f"{PAYPAL_API_BASE}/v1/oauth2/token",
         data={"grant_type": "client_credentials"},
@@ -512,7 +501,6 @@ async def capture_diamond_order(
 
     access_token = auth_response.json()["access_token"]
 
-    # Capture the order
     capture_response = await httpx.AsyncClient().post(
         f"{PAYPAL_API_BASE}/v2/checkout/orders/{order_id}/capture",
         headers={
@@ -523,7 +511,6 @@ async def capture_diamond_order(
     if capture_response.status_code not in (200, 201):
         raise HTTPException(500, "Payment capture failed")
 
-    # Credit diamonds
     packages = {
         "60": 60,
         "120": 120,
@@ -537,7 +524,6 @@ async def capture_diamond_order(
     new_diamonds = user.get("diamonds", 0) + diamonds
     sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
 
-    # Record purchase
     sb.table("diamond_purchases").insert({
         "purchase_id": f"diam_{uuid.uuid4().hex[:12]}",
         "user_id": user["user_id"],
@@ -547,8 +533,6 @@ async def capture_diamond_order(
     }).execute()
 
     return {"ok": True, "diamonds": new_diamonds}
-
-
 
 # ---------- Earn tokens ----------
 @api_router.post("/earn-tokens")
@@ -872,7 +856,6 @@ def get_discover_profiles(
 
     random.shuffle(filtered)
 
-    # Determine how many profiles to return
     if page is not None and limit is not None:
         start = (page - 1) * limit
         end = start + limit
@@ -880,7 +863,6 @@ def get_discover_profiles(
     else:
         result = filtered[:50]
 
-    # Charge tokens for the actual number of profiles returned (for free users)
     if not is_premium(user):
         require_token(user, len(result))
 
