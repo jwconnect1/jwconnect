@@ -567,9 +567,11 @@ def earn_tokens(user: dict = Depends(get_current_user)):
         last = _parse_dt(last_earn)
         if datetime.now(timezone.utc) - last < timedelta(minutes=1):
             raise HTTPException(400, "You can earn tokens again in a minute")
-    new_tokens = user.get("tokens", 0) + 10
+    new_tokens = user.get("tokens", 0) + 15            # <-- changed from 10 to 15
     sb.table("users").update({"tokens": new_tokens, "last_token_earned": datetime.now(timezone.utc).isoformat()}).eq("user_id", user["user_id"]).execute()
-    return {"ok": True, "tokens_awarded": 10, "total_tokens": new_tokens}
+    return {"ok": True, "tokens_awarded": 15, "total_tokens": new_tokens}   # <-- changed
+
+
 
 # ---------- Location API ----------
 @api_router.post("/location/update")
