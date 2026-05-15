@@ -419,6 +419,7 @@ async def create_diamond_order(
     request: Request,
     user: dict = Depends(get_current_user)
 ):
+
     packages = {
         "52": {"diamonds": 52, "amount": 3.00, "label": "$3"},
         "120": {"diamonds": 120, "amount": 7.00, "label": "$7"},
