@@ -162,7 +162,7 @@ def is_premium(user: dict) -> bool:
 def require_token(user: dict, cost: int = 1):
     if is_premium(user): return
     if user.get("tokens", 0) < cost:
-        raise HTTPException(status_code=402, detail="You need a token to do this. Earn them in the balloon game or upgrade to premium.")
+        raise HTTPException(status_code=402, detail=f"You need {cost} token(s). Earn them in the balloon game or upgrade to premium.")
     sb.table("users").update({"tokens": user["tokens"] - cost}).eq("user_id", user["user_id"]).execute()
     user["tokens"] -= cost
 
@@ -194,7 +194,7 @@ class ProfileSetupPayload(BaseModel):
     hide_from_min_age: Optional[int] = None; hide_from_max_age: Optional[int] = None
     hide_from_health_statuses: Optional[str] = ""
     visible_to: Optional[str] = "all"           # "all" or "verified_only"
-    lock_all_images: Optional[bool] = False     # if True, all images locked for free viewers
+    lock_all_images: Optional[bool] = False
 
 class ProfileUpdatePayload(BaseModel):
     date_of_birth: Optional[str] = None; gender: Optional[str] = None; health_status: Optional[str] = None
@@ -360,6 +360,15 @@ def delete_account(user: dict = Depends(get_current_user)):
 def get_ethnicities():
     return ETHNICITY_LIST
 
+# ---------- Stats ----------
+@api_router.get("/stats/online")
+def online_users():
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=5)
+    res = sb.table("users").select("user_id", count="exact").gte("last_active", cutoff.isoformat()).execute()
+    count = res.count if hasattr(res, 'count') else 0
+    return {"online": count}
+
 # ---------- Economy ----------
 @api_router.post("/purchase/verify")
 def purchase_verify(user: dict = Depends(get_current_user)):
@@ -372,6 +381,8 @@ def purchase_verify(user: dict = Depends(get_current_user)):
 
 @api_router.post("/purchase/premium")
 def purchase_premium(tier: str = "gold", user: dict = Depends(get_current_user)):
+    if not user.get("verified"):
+        raise HTTPException(400, "You must be verified before purchasing premium.")
     if is_premium(user):
         raise HTTPException(400, "You already have an active premium subscription. Please wait for it to expire.")
     if tier not in ["gold", "platinum"]:
@@ -528,7 +539,6 @@ def get_profile(user: dict) -> dict:
 def setup_profile(payload: ProfileSetupPayload, user: dict = Depends(get_current_user)):
     if payload.ethnicity and payload.ethnicity not in ETHNICITY_LIST:
         raise HTTPException(400, f"Ethnicity must be one of: {', '.join(ETHNICITY_LIST)}")
-    # Only verified users can set visibility or lock images
     if not user.get("verified"):
         payload.visible_to = "all"
         payload.lock_all_images = False
@@ -639,7 +649,7 @@ def update_profile(payload: ProfileUpdatePayload, user: dict = Depends(get_curre
 def get_my_profile(user: dict = Depends(get_current_user)):
     return get_profile(user)
 
-# ---------- Discovery (with token charge, visibility filter, sexual orientation filter) ----------
+# ---------- Discovery (token per profile) ----------
 @api_router.get("/discover/profiles")
 def get_discover_profiles(
     user: dict = Depends(get_current_user),
@@ -653,9 +663,6 @@ def get_discover_profiles(
     max_distance: Optional[int] = None,
     sexual_orientation: Optional[str] = None,
 ):
-    # Charge 1 token for non-premium users to access discovery
-    require_token(user, 1)
-
     viewer_profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user["user_id"]).maybe_single().execute())
     if not viewer_profile: return []
     my_lat = viewer_profile.get("gps_latitude") or viewer_profile.get("latitude")
@@ -693,25 +700,18 @@ def get_discover_profiles(
     filtered = []
     for p in profiles:
         if p.get("profile_hidden"): continue
-        # Visibility check: if target profile is visible only to verified users, and viewer is not verified, skip
         if p.get("visible_to") == "verified_only" and not user.get("verified"):
             continue
-        # Age filter
         if p.get("date_of_birth"):
             try:
                 dob = datetime.fromisoformat(str(p["date_of_birth"])).date()
                 age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
                 if age < pref_min_age or age > pref_max_age: continue
             except: pass
-        # Gender filter
         if pref_gender and p.get("gender") != pref_gender: continue
-        # Health status filter
         if pref_health and p.get("health_status") != pref_health: continue
-        # Country filter
         if pref_country and p.get("country") != pref_country: continue
-        # Sexual orientation filter
         if pref_sexual_orientation and p.get("sexual_orientation") != pref_sexual_orientation: continue
-        # Distance filter
         p_lat = p.get("gps_latitude"); p_lon = p.get("gps_longitude")
         distance = None
         if p_lat is not None and p_lon is not None:
@@ -725,12 +725,19 @@ def get_discover_profiles(
 
     random.shuffle(filtered)
 
+    # Determine how many profiles to return
     if page is not None and limit is not None:
         start = (page - 1) * limit
         end = start + limit
-        return filtered[start:end]
+        result = filtered[start:end]
     else:
-        return filtered[:50]
+        result = filtered[:50]
+
+    # Charge tokens for the actual number of profiles returned (for free users)
+    if not is_premium(user):
+        require_token(user, len(result))
+
+    return result
 
 @api_router.post("/discover/swipe")
 def swipe_profile(payload: SwipePayload, user: dict = Depends(get_current_user)):
