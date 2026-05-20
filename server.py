@@ -1606,58 +1606,79 @@ def report_content(payload: dict, user: dict = Depends(get_current_user)):
     )
 
     return {"ok": True}
+
+
+
+
 # ---------- Admin: get detailed reports ----------
 @api_router.get("/admin/reports-detailed")
-def admin_get_detailed_reports(user: dict = Depends(get_current_user)):
+def get_detailed_reports(user: dict = Depends(get_current_user)):
     if not user.get("is_admin"):
-        raise HTTPException(403, "Admin access required")
+        raise HTTPException(403, "Admin only")
 
+    # Fetch all reports from the user_reports table
     reports = sb.table("user_reports").select("*").order("created_at", desc=True).execute().data or []
-    result = []
+
+    enriched = []
     for r in reports:
-        meta = r.get("metadata") or {}
-        # fetch the reported user's profile and story/image details
-        reported_user = _maybe(sb.table("users").select("email,name,verified,premium_tier").eq("user_id", r["reported_user_id"]).maybe_single().execute())
-        reporter = _maybe(sb.table("users").select("email,name").eq("user_id", r["reporter_id"]).maybe_single().execute())
+        item = dict(r)
 
-        entry = {
-            "report_id": r["report_id"],
-            "reporter_name": reporter.get("name") or reporter.get("email","Unknown") if reporter else "Unknown",
-            "reporter_email": reporter.get("email","Unknown") if reporter else "Unknown",
-            "reported_name": reported_user.get("name") or reported_user.get("email","Unknown") if reported_user else "Unknown",
-            "reported_email": reported_user.get("email","Unknown") if reported_user else "Unknown",
-            "reported_user_id": r["reported_user_id"],
-            "reason": r["reason"],
-            "created_at": r["created_at"],
-            "type": meta.get("type", "user"),
-            "image_index": meta.get("image_index"),
-            "story_id": meta.get("story_id"),
-        }
+        # Parse the reason string to get base reason and context
+        reason_full = r.get("reason", "")
+        base_reason = reason_full
+        image_index = None
+        story_id = None
 
-        # If story report, fetch story content
-        if entry["story_id"]:
-            story = _maybe(sb.table("stories").select("*").eq("story_id", entry["story_id"]).maybe_single().execute())
-            if story:
-                entry["story_content"] = story.get("content","")
-                entry["story_author"] = story.get("author_name","")
-            else:
-                entry["story_content"] = "[deleted]"
+        # Extract image index if present, e.g., "nudity (image 0)"
+        if "(image " in reason_full:
+            base_reason = reason_full.split(" (image ")[0]
+            try:
+                image_index = int(reason_full.split("(image ")[1].split(")")[0])
+            except:
+                pass
+        # Extract story id if present, e.g., "racist (story story_abc123)"
+        if "(story " in reason_full:
+            base_reason = reason_full.split(" (story ")[0]
+            story_id_part = reason_full.split("(story ")[1].rstrip(")")
+            story_id = story_id_part.strip()
 
-        # If photo report, fetch the image URL(s)
-        if entry["image_index"] is not None:
-            profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", r["reported_user_id"]).maybe_single().execute())
+        item["reason_clean"] = base_reason
+        item["type"] = "photo" if image_index is not None else ("story" if story_id else "user")
+
+        # Get reporter info
+        reporter = sb.table("users").select("email,name").eq("user_id", r["reporter_id"]).maybe_single().execute().data
+        item["reporter_name"] = reporter["name"] or reporter["email"] if reporter else "Unknown"
+
+        # Get reported user info
+        target = sb.table("users").select("email,name").eq("user_id", r["reported_user_id"]).maybe_single().execute().data
+        item["reported_name"] = target["name"] or target["email"] if target else "Unknown"
+        item["reported_email"] = target["email"] if target else ""
+
+        # If photo report, fetch the specific image URL
+        if item["type"] == "photo" and image_index is not None:
+            profile = sb.table("user_profiles").select("profile_image,gallery_images").eq("user_id", r["reported_user_id"]).maybe_single().execute().data
             if profile:
-                if entry["image_index"] == 0:
-                    entry["image_url"] = profile.get("profile_image")
+                if image_index == 0:
+                    item["image_url"] = profile.get("profile_image")
                 else:
                     gallery = profile.get("gallery_images") or []
-                    idx = entry["image_index"]
-                    if 0 <= idx < len(gallery):
-                        entry["image_url"] = gallery[idx]
+                    if image_index - 1 < len(gallery):
+                        item["image_url"] = gallery[image_index - 1]
 
-        result.append(entry)
+        # If story report, fetch story content
+        if item["type"] == "story" and story_id:
+            story = sb.table("stories").select("content").eq("story_id", story_id).maybe_single().execute().data
+            if story:
+                item["story_content"] = story.get("content", "")
 
-    return result
+        enriched.append(item)
+
+    return enriched
+
+
+
+
+
 
 # ---------- Admin: delete reported photo ----------
 @api_router.delete("/admin/reports/{report_id}/delete-photo")
