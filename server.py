@@ -1855,6 +1855,8 @@ def get_group(group_id: str, user: dict = Depends(get_current_user)):
 
     return group
 
+    
+
 
 @api_router.post("/groups/{group_id}/join")
 def join_group(group_id: str, user: dict = Depends(get_current_user)):
@@ -2072,7 +2074,7 @@ def edit_group(group_id: str, payload: dict, user: dict = Depends(get_current_us
 
 
 
-    
+
 app.include_router(api_router)
 
 if __name__ == "__main__":
