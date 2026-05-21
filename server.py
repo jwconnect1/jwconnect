@@ -1737,7 +1737,7 @@ def admin_delete_reported_story(report_id: str, user: dict = Depends(get_current
 
 
 
-// lost child
+# lost child
 @api_router.get("/users/{user_id}/profile")
 def get_user_profile(user_id: str):
     profile = _maybe(sb.table("user_profiles").select("*").eq("user_id", user_id).maybe_single().execute())
