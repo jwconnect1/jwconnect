@@ -914,6 +914,7 @@ def get_discover_profiles(
         status = user_status.get(p["user_id"], {})
         p["verified"] = status.get("verified", False)
         p["premium_tier"] = status.get("premium_tier")
+        p["last_active"] = status.get("last_active")
         filtered.append(p)
 
     if not is_premium(user):
@@ -1740,4 +1741,4 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT",8000)))
     
-   
+   get_discover_profiles
