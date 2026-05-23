@@ -2473,6 +2473,74 @@ def reset_password(payload: dict):
 
     return {"ok": True, "message": "Password reset successfully. You can now log in."}
 
+
+# ---------- Google Play Purchase Verification ----------
+import google.auth
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
+
+@api_router.post("/purchase/google-play")
+def verify_google_purchase(payload: dict, user: dict = Depends(get_current_user)):
+    product_id = payload.get("product_id")
+    purchase_token = payload.get("purchase_token")
+
+    if not product_id or not purchase_token:
+        raise HTTPException(400, "Missing product_id or purchase_token")
+
+    # Map product IDs to diamond amounts
+    diamond_map = {
+        "diamonds_52": 52,
+        "diamonds_120": 120,
+        "diamonds_310": 310,
+        "diamonds_770": 770,
+    }
+    diamonds = diamond_map.get(product_id)
+    if not diamonds:
+        raise HTTPException(400, "Invalid product_id")
+
+    # Verify with Google Play
+    try:
+        # Use service account credentials – store as environment variable
+        creds_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+        if not creds_json:
+            raise HTTPException(500, "Service account not configured")
+
+        credentials = service_account.Credentials.from_service_account_info(
+            json.loads(creds_json),
+            scopes=["https://www.googleapis.com/auth/androidpublisher"],
+        )
+        service = build("androidpublisher", "v3", credentials=credentials)
+        result = service.purchases().products().get(
+            packageName="date.perfecthorse.haven",
+            productId=product_id,
+            token=purchase_token,
+        ).execute()
+
+        if result.get("purchaseState") == 0:  # 0 = purchased, not yet consumed
+            # Consume the purchase (optional, depending on your setup)
+            # service.purchases().products().consume(...)
+
+            # Credit diamonds
+            new_diamonds = user.get("diamonds", 0) + diamonds
+            sb.table("users").update({"diamonds": new_diamonds}).eq("user_id", user["user_id"]).execute()
+
+            # Record purchase
+            sb.table("diamond_purchases").insert({
+                "purchase_id": f"diam_{uuid.uuid4().hex[:12]}",
+                "user_id": user["user_id"],
+                "item": f"{diamonds}_diamonds_google",
+                "diamond_cost": 0,
+                "purchased_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+
+            return {"ok": True, "diamonds": new_diamonds}
+        else:
+            raise HTTPException(400, "Purchase not valid or already consumed")
+    except Exception as e:
+        logger.error(f"Google Play verification failed: {e}")
+        raise HTTPException(400, "Purchase verification failed")
+
+
 app.include_router(api_router)
 
 if __name__ == "__main__":
