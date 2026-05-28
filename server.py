@@ -33,12 +33,15 @@ logger = logging.getLogger(__name__)
 # ---------- CORS ----------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # wildcard only
-    allow_credentials=False,      # required when using "*"
+    allow_origins=[
+        "https://jwdate-e6fe5.web.app",
+        "https://jwdate-e6fe5.firebaseapp.com",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 api_router = APIRouter(prefix="/api")
 
 # ---------- Simple in‑memory rate limiter ----------
