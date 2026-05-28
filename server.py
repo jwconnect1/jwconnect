@@ -33,14 +33,10 @@ logger = logging.getLogger(__name__)
 # ---------- CORS ----------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://jwdate-e6fe5.web.app",          # Firebase production
-        "http://localhost:3000",                   # local development
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],          # wildcard only
+    allow_credentials=False,      # required when using "*"
     allow_methods=["*"],
     allow_headers=["*"],
-    allow_origins=["*"]
 )
 
 api_router = APIRouter(prefix="/api")
