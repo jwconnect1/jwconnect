@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # ---------- CORS ----------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://havenpositive.online","https://www.havenpositive.online","https://haven-83b20.web.app","https://haven-83b20.firebaseapp.com","https://haven-hmwq.onrender.com","http://localhost:3000"],
+    allow_origins=["https://.onrender.jwconnect1com","http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -490,8 +490,8 @@ async def create_diamond_order(
             "brand_name": "Haven",
             "shipping_preference": "NO_SHIPPING",
             "user_action": "PAY_NOW",
-            "return_url": "https://havenpositive.online/shop",
-            "cancel_url": "https://havenpositive.online/shop",
+            "return_url": "",
+            "cancel_url": "",
         }
     }
 
