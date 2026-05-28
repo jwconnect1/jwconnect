@@ -2333,7 +2333,7 @@ def signup_email(payload: dict, request: Request, response: Response):
     }).execute()
 
     # ---- Send verification email via Brevo HTTP API (in background) ----
-    verify_link = f"https://havenpositive.online/verify-email?token={verification_token}"
+    verify_link = f"https://jwdate-e6fe5.web.app/verify-email?token={verification_token}"
     body = f"""
     <h2>Welcome to Haven!</h2>
     <p>Please verify your email by clicking the link below:</p>
@@ -2437,7 +2437,7 @@ def forgot_password(payload: dict):
         "reset_token": reset_token, "reset_token_expires": reset_expires
     }).eq("user_id", user["user_id"]).execute()
 
-    reset_link = f"https://havenpositive.online/reset-password?token={reset_token}"
+    reset_link = f"https://jwdate-e6fe5.web.app/reset-password?token={reset_token}"
     body = f"""
     <h2>Password Reset</h2>
     <p>Click the link below to reset your password:</p>
